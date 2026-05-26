@@ -1,0 +1,109 @@
+%%{init: {'theme':'dark', 'flowchart':{'curve':'linear','htmlLabels':true}}}%%
+flowchart TD
+    %% ============= DATA INGESTION =============
+    XLSX["📊 data/Expansion_Agent_1.xlsx<br/>117 accounts × 7 sheets"]:::data
+    ONTO["🧠 Zuddl GTM Ontology<br/>PAIN · TRIG · EXP · P · CHURN · Competitors"]:::brain
+    PRIORRUN["📁 run_log/<br/>(previous signals + feedback)"]:::data
+
+    %% ============= REPOSITORY =============
+    REPO["repository.py<br/>• Join 5 sheets by 15-char Account ID<br/>• AE/CSM from Account-Data!C/DV<br/>• Log join misses to data_quality.csv"]:::module
+    NODES["117 AccountNodes<br/>(joined per-account record)"]:::data
+
+    %% ============= ACCOUNT AGENT =============
+    AGENT["AccountAgent class<br/>━━━━━━━━━━━━━━━━━━<br/>1️⃣ Present State (now)<br/>2️⃣ Historical (past runs)<br/>3️⃣ Narrative (Gong+FF story)<br/>4️⃣ Feedback (human signals)"]:::brain
+
+    %% ============= STEP 1: TRIGGER =============
+    TRIG{{"Step 1 · Trigger<br/>Has Use Case Gap (col K)?"}}:::decision
+    NONTRIG["13 accounts — no gap<br/>→ run_log/non_triggered.csv"]:::dropped
+
+    %% ============= STEP 2: DISQUALIFIERS =============
+    DQ1{{"DQ1 · Red Adoption?<br/>(Expansion Data!S)"}}:::decision
+    DQ2{{"DQ2 · Activity &lt; 30d?<br/>(Account-Data!AG)"}}:::decision
+    DQ3{{"DQ3 · Named Open Opp?<br/>(hardcoded 10-account list)"}}:::decision
+    DQ4{{"DQ4 · Open Opp Flag?<br/>(Account-Data col 196)"}}:::decision
+    DQ5{{"DQ5 · Inactive?<br/>(cols 205/207)"}}:::decision
+
+    NOTIF["🟡 60 Notifications<br/>(transparency log)<br/>━━━━━━━━━━━━━━<br/>+ Investigate panel:<br/>  • why disqualified<br/>  • what would re-qualify<br/>  • factor-by-factor breakdown<br/>  • risk indicators"]:::dropped
+
+    %% ============= STEP 3: RANK =============
+    RANK["Step 3 · Deterministic Rank<br/>━━━━━━━━━━━━━━━━━━━━━━━<br/>priority_score =<br/>   0.40 × adoption_score<br/> + 0.30 × renewal_proximity<br/> + 0.30 × log1p(usage)"]:::module
+    SURV["44 Survivors<br/>(sorted by priority_score)"]:::data
+
+    %% ============= STEP 4: CONTEXT =============
+    CTX["Step 4 · Context Assembly<br/>━━━━━━━━━━━━━━━━━━━━━<br/>AccountContext per survivor<br/>≤ 6000 token budget<br/>Prune: transcripts → contacts → arrays"]:::module
+
+    %% ============= STEP 5: REASONING (LLM) =============
+    FANOUT["LangGraph Send fan-out<br/>max_concurrency = 8"]:::module
+    LLM["Step 5 · Claude Sonnet 4.5<br/>━━━━━━━━━━━━━━━━━━━━━━<br/>JSON mode · Pydantic-validated<br/>One call per survivor (parallel)"]:::llm
+
+    GROUND["Decision procedure<br/>━━━━━━━━━━━━━<br/>1. Confirm gap is real<br/>2. Map to ontology IDs<br/>3. Pick persona (P-001..008)<br/>4. Walk causal chain<br/>5. Recommend AE/CSM/BOTH<br/>6. Write 5-section output<br/>7. Self-score confidence"]:::brain
+
+    RETRY{{"Schema valid?"}}:::decision
+    REJECT["is_signal = false<br/>(false-positive caught)"]:::dropped
+
+    %% ============= STEP 6: CAP + ROUTE =============
+    CAP["Step 6 · Cap + Route<br/>━━━━━━━━━━━━━━━━<br/>final_score = 0.5·conf + 0.5·priority<br/>Top 5 per AE / Top 5 per CSM<br/>Drop priority_band = low<br/>Extras (rank 6-10) → expandable"]:::module
+
+    %% ============= STEP 7: PERSIST =============
+    PERSIST["persist.py<br/>━━━━━━━━━<br/>output/signals.json<br/>output/queues/by_ae/*.json<br/>output/queues/by_csm/*.json<br/>output/notifications/*<br/>run_log/* (audit)"]:::module
+
+    %% ============= UI =============
+    API["FastAPI · :8000<br/>JSON passthrough"]:::ui
+    AEUI["AE/CSM Dashboard<br/>━━━━━━━━━━━━<br/>Top 5 · ranks 6-10 · transparency"]:::ui
+    SIGUI["Signal detail page<br/>━━━━━━━━━━━━━━━<br/>5 narrative cards (left)<br/>Persona + Email (right)"]:::ui
+    EXECUI["Executive Dashboard<br/>━━━━━━━━━━━━━━<br/>KPIs · funnel · team breakdown<br/>churn risk surface"]:::ui
+    FB["Mark Relevant / Actioned<br/>→ outcomes.csv"]:::feedback
+
+    %% ============= EDGES =============
+    XLSX --> REPO
+    PRIORRUN -.->|hydrate memory| AGENT
+    REPO --> NODES
+    NODES --> AGENT
+    AGENT --> TRIG
+
+    TRIG -->|no| NONTRIG
+    TRIG -->|yes · 104| DQ1
+    DQ1 -->|yes · 27 dropped| NOTIF
+    DQ1 -->|no · 77| DQ2
+    DQ2 -->|yes · 23 dropped| NOTIF
+    DQ2 -->|no · 54| DQ3
+    DQ3 -->|yes · 6 dropped| NOTIF
+    DQ3 -->|no · 48| DQ4
+    DQ4 -->|yes · 2 dropped| NOTIF
+    DQ4 -->|no · 46| DQ5
+    DQ5 -->|yes · 2 dropped| NOTIF
+    DQ5 -->|no · 44| RANK
+
+    RANK --> SURV
+    SURV --> CTX
+    CTX --> FANOUT
+    ONTO --> LLM
+    GROUND --> LLM
+    FANOUT --> LLM
+
+    LLM --> RETRY
+    RETRY -->|invalid| LLM
+    RETRY -->|invalid x2| REJECT
+    RETRY -->|valid + is_signal=false| REJECT
+    RETRY -->|valid + is_signal=true| CAP
+
+    REJECT -.->|logged in audit| PERSIST
+    CAP --> PERSIST
+    NOTIF --> PERSIST
+
+    PERSIST --> API
+    API --> AEUI
+    API --> SIGUI
+    API --> EXECUI
+    SIGUI --> FB
+    FB -.->|next run input| PRIORRUN
+
+    %% ============= STYLES =============
+    classDef data fill:#1f2937,stroke:#6b7280,color:#e5e7eb
+    classDef module fill:#0e7490,stroke:#22d3ee,color:#fff
+    classDef llm fill:#7c3aed,stroke:#a78bfa,color:#fff
+    classDef brain fill:#a16207,stroke:#fbbf24,color:#fff
+    classDef decision fill:#1e3a8a,stroke:#60a5fa,color:#fff
+    classDef dropped fill:#7f1d1d,stroke:#f87171,color:#fff
+    classDef ui fill:#065f46,stroke:#34d399,color:#fff
+    classDef feedback fill:#831843,stroke:#f472b6,color:#fff

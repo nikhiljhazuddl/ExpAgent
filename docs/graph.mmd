@@ -1,0 +1,32 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	load_accounts(load_accounts)
+	filter(filter)
+	notify_disqualified(notify_disqualified)
+	rank(rank)
+	assemble(assemble)
+	score_one(score_one)
+	cap(cap)
+	persist(persist)
+	fan_out_router(fan_out_router)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> load_accounts;
+	assemble -. &nbsp;fan_out&nbsp; .-> fan_out_router;
+	assemble -.-> persist;
+	cap --> persist;
+	fan_out_router -.-> score_one;
+	filter --> notify_disqualified;
+	filter --> rank;
+	load_accounts --> filter;
+	notify_disqualified --> assemble;
+	rank --> assemble;
+	score_one --> cap;
+	persist --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
