@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MissingUseCase = Literal["Webinar", "Field Events", "Third-Party Events", "Conferences"]
 PriorityBand = Literal["high", "medium", "low"]
-ActionOwner = Literal["AE", "CSM", "BOTH"]
+ActionOwner = Literal["CSM"]  # AE removed — CSM-centric
 BuyingRole = Literal["economic_buyer", "champion", "influencer", "user"]
 ContactSource = Literal["sf", "clay"]
 
@@ -130,6 +130,15 @@ class Signal(BaseModel):
     explanation_maturity: Optional[list["ExplanationBullet"]] = None
     explanation_triggers: Optional[list["ExplanationBullet"]] = None
     explanation_expansion_thesis: Optional[list["ExplanationBullet"]] = None
+
+    # Conversation evidence — Gong + Fireflies data attached to every signal
+    gong_summary: Optional[str] = None
+    gong_key_points: list[str] = Field(default_factory=list)
+    gong_date_range: Optional[str] = None
+    gong_call_count: int = 0
+    fireflies_summary: Optional[str] = None
+    fireflies_action_items: list[str] = Field(default_factory=list)
+    fireflies_meeting_count: int = 0
 
     # Orchestrator-computed (not Claude). Settable post-hoc.
     priority_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)

@@ -133,6 +133,23 @@ async def score_one_node(payload: dict) -> dict:
     priority_score = payload["priority_score"]
     sig = await score_account(ctx)
     sig.priority_score = priority_score
+
+    # Attach conversation evidence from context (Claude prompt may omit these)
+    conv = ctx.conversations
+    if not sig.gong_summary and conv.gong_business_summary:
+        sig.gong_summary = conv.gong_business_summary
+    if not sig.gong_key_points and conv.gong_key_points:
+        sig.gong_key_points = list(conv.gong_key_points)
+    if not sig.gong_date_range and conv.date_range:
+        sig.gong_date_range = conv.date_range
+    if sig.gong_call_count == 0 and conv.total_calls:
+        sig.gong_call_count = conv.total_calls
+    if not sig.fireflies_summary and conv.fireflies_overview:
+        sig.fireflies_summary = conv.fireflies_overview
+    if not sig.fireflies_action_items and conv.fireflies_action_items:
+        sig.fireflies_action_items = list(conv.fireflies_action_items)
+    # fireflies_meeting_count: not tracked in ConversationsCtx; leave as 0
+
     if sig.is_signal and sig.confidence is not None:
         sig.final_score = 0.5 * sig.confidence + 0.5 * priority_score
         # Apply spec's priority_band thresholds based on final_score.

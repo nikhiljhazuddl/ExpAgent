@@ -15,9 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field
 class Ownership(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    ae_name: Optional[str] = None
+    # CSM-centric — AE removed. CSM is the sole owner.
+    ae_name: Optional[str] = None   # kept for schema compat but unused
     ae_role: Optional[str] = None
-    csm_name: Optional[str] = None
+    csm_name: Optional[str] = None  # sourced from Pylon assignee
     csm_missing: bool = False
 
 
