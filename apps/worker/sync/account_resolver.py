@@ -69,6 +69,30 @@ class AccountResolver:
         self.sb = sb
         # cache: normalised_domain OR "name:<normalised_name>" → account uuid
         self._cache: dict[str, str] = {}
+        self._preload()
+
+    def _preload(self) -> None:
+        """Bulk-load all existing accounts into cache to avoid per-row DB hits."""
+        page_size = 1000
+        offset = 0
+        total = 0
+        while True:
+            r = self.sb.table("accounts").select("id, name, domain, email_domain") \
+                .range(offset, offset + page_size - 1).execute()
+            rows = r.data or []
+            for row in rows:
+                uid = row["id"]
+                dom = row.get("domain") or row.get("email_domain")
+                if dom:
+                    self._cache[normalise_domain(dom) or dom] = uid
+                norm_name = normalise_name(row.get("name"))
+                if norm_name:
+                    self._cache[f"name:{norm_name}"] = uid
+            total += len(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        log.info("resolver: preloaded %d accounts into cache", total)
 
     # ── public API ────────────────────────────────────────────────────────────
 
