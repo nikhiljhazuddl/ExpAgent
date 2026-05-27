@@ -1,0 +1,18 @@
+[project]
+name = "gtm-mesh-worker"
+version = "0.1.0"
+description = "GTM Mesh — Salesforce sync worker"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "supabase>=2.7.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.1",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

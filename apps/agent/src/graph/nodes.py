@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 def load_accounts_node(state: AgentState) -> dict:
     settings = get_settings()
-    repo = Repository(settings.data_xlsx_path)
+    repo = Repository()  # reads from Supabase — xlsx_path no longer needed
     accounts = repo.load_accounts()
     # Persist DQ findings as part of every run. The persist_node will also re-flush.
     dq_path = settings.run_log_dir / "data_quality.csv"

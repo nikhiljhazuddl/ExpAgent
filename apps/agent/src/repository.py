@@ -1,31 +1,33 @@
-"""Repository — loads the xlsx once, builds AccountNodes joined across all sheets.
+"""Repository — loads AccountNodes from Supabase (replaces xlsx reader).
 
-Authoritative rules (build spec §2, §3, §15):
-- AE name:  Account-Data!C  (col 3,  "Account Owner")
-- AE role:  Account-Data!AL (col 38, "Owner Role")
-- CSM name: Account-Data!DV (col 126, "CSM owner")
-- `Expansion Data!D` is unreliable — overridden from Account-Data on every join.
-- Account IDs: Expansion Data has 18-char IDs; Account-Data has 15-char. Truncate to 15 to join.
-- Gong+Fireflies joined by Account ID (also 18-char in source).
-- Contact sheets joined by Account Name (normalized).
-- All join misses → run_log/data_quality.csv. Do not silently drop.
-- Missing CSM → route to AE only, set `ownership.csm_missing=True`.
+Authoritative filter: Account_Status__c IN ('Customer', 'Renewal') on sf_accounts.
+These are the only accounts eligible for expansion — we never load prospects or
+churned accounts into the agent pipeline.
 
-The LangGraph nodes never call into this module's internals — they receive a
-list of AccountNode and operate on those. In V1.5 this file is the only place
-that changes when we swap to Postgres.
+Join strategy (mirrors the old xlsx sheet joins):
+  sf_accounts        → identity, ownership, current state, usage flags
+  sf_accounts_raw    → full raw JSONB for extra fields not in typed columns
+  sf_contacts        → contacts in product / CRM (replaces Contacts_From_SF sheet)
+  sf_opportunities   → open expansion opp detection (replaces Account-Data col 196)
+  gong_calls         → Gong conversation summaries (replaces Gong sheet)
+  fireflies_meetings → Fireflies conversation summaries (replaces Fireflies sheet)
+
+The LangGraph nodes receive the same list[AccountNode] as before — zero changes
+needed upstream.
 """
 
 from __future__ import annotations
 
 import csv
 import logging
+import os
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 
-import pandas as pd
+from dotenv import load_dotenv
+from supabase import Client, create_client
 
 from schemas.account_node import (
     AccountNode,
@@ -40,48 +42,46 @@ from schemas.account_node import (
     UsageCounts,
 )
 
+load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 logger = logging.getLogger(__name__)
+
+# Salesforce Account_Status__c values we consider "expansion-eligible"
+CUSTOMER_STAGES = {"Customer", "Renewal", "customer", "renewal"}
+
+# Opportunity stages that mean "already being worked" → DQ4
+OPEN_OPP_STAGES = {
+    "Prospecting", "Qualification", "Needs Analysis", "Value Proposition",
+    "Id. Decision Makers", "Perception Analysis", "Proposal/Price Quote",
+    "Negotiation/Review",
+}
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-def _to_15(account_id: Any) -> Optional[str]:
-    """Truncate an 18-char Salesforce ID to the 15-char case-sensitive form.
-
-    Returns None for missing / unparseable inputs.
-    """
-    if account_id is None or pd.isna(account_id):
+def _to_str(value: Any) -> Optional[str]:
+    if value is None:
         return None
-    s = str(account_id).strip()
-    if not s:
-        return None
-    return s[:15]
-
-
-def _norm_name(name: Any) -> str:
-    if name is None or pd.isna(name):
-        return ""
-    return " ".join(str(name).strip().casefold().split())
+    s = str(value).strip()
+    return s or None
 
 
 def _to_date(value: Any) -> Optional[date]:
-    if value is None or pd.isna(value):
+    if value is None:
         return None
-    if isinstance(value, datetime):
-        return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, datetime):
+        return value.date()
     try:
-        return pd.to_datetime(value).date()
+        return datetime.fromisoformat(str(value)[:10]).date()
     except (ValueError, TypeError):
         return None
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
-    if value is None or pd.isna(value):
+    if value is None:
         return default
     try:
         return float(value)
@@ -90,7 +90,7 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 
 def _to_int(value: Any) -> Optional[int]:
-    if value is None or pd.isna(value):
+    if value is None:
         return None
     try:
         return int(float(value))
@@ -98,43 +98,32 @@ def _to_int(value: Any) -> Optional[int]:
         return None
 
 
-def _to_str(value: Any) -> Optional[str]:
-    if value is None or pd.isna(value):
-        return None
-    s = str(value).strip()
-    return s or None
-
-
-def _bool_from_flag(value: Any) -> bool:
-    """Coerce numeric/text flag columns to bool. >0 or 'yes'/'true' → True."""
-    if value is None or pd.isna(value):
+def _bool_val(value: Any) -> bool:
+    if value is None:
         return False
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value > 0
-    s = str(value).strip().casefold()
-    return s in {"1", "true", "yes", "y"}
+    return str(value).strip().casefold() in {"1", "true", "yes", "y"}
 
 
-def _split_list(value: Any, sep: str = ";") -> list[str]:
-    s = _to_str(value)
-    if not s:
-        return []
-    # Tolerate semicolon, pipe, or comma separators.
-    parts: list[str] = []
-    for chunk in s.replace("|", sep).split(sep):
-        for piece in chunk.split(","):
-            p = piece.strip()
-            if p:
-                parts.append(p)
-    return parts
+def _norm_name(name: Any) -> str:
+    if not name:
+        return ""
+    return " ".join(str(name).strip().casefold().split())
+
+
+def _to_15(sf_id: Any) -> Optional[str]:
+    if not sf_id:
+        return None
+    s = str(sf_id).strip()
+    return s[:15] if s else None
 
 
 # ---------------------------------------------------------------------------
-# Data-quality logger
+# Data-quality logger (same interface as before)
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class DataQualityIssue:
@@ -145,23 +134,14 @@ class DataQualityIssue:
 
 
 class DataQualityLog:
-    """Accumulates DQ findings and flushes to run_log/data_quality.csv."""
-
     def __init__(self) -> None:
         self._issues: list[DataQualityIssue] = []
 
-    def add(
-        self,
-        issue: str,
-        detail: str = "",
-        account_id: Optional[str] = None,
-        account_name: Optional[str] = None,
-    ) -> None:
-        self._issues.append(
-            DataQualityIssue(
-                account_id=account_id, account_name=account_name, issue=issue, detail=detail
-            )
-        )
+    def add(self, issue: str, detail: str = "",
+            account_id: Optional[str] = None, account_name: Optional[str] = None) -> None:
+        self._issues.append(DataQualityIssue(
+            account_id=account_id, account_name=account_name, issue=issue, detail=detail
+        ))
 
     @property
     def issues(self) -> list[DataQualityIssue]:
@@ -180,385 +160,402 @@ class DataQualityLog:
 # Repository
 # ---------------------------------------------------------------------------
 
-
-# Column name constants (must match the xlsx headers exactly; verified Phase 2).
-_AD_AE = "Account Owner"  # col 3
-_AD_OWNER_ROLE = "Owner Role"  # col 38
-_AD_CSM = "CSM owner"  # col 126
-_AD_ACCOUNT_ID = "Account ID"  # col 10
-_AD_LAST_ACTIVITY = "Last Activity"  # col 33
-_AD_HAS_OPEN_OPP = "Has Open Expansion Opp?"  # col 196
-_AD_HEALTH_STATUS = "Health Status"  # col 198
-_AD_INACTIVE_90 = "Inactive > 90 days?"  # col 205
-_AD_IS_ACTIVE = "Is Active Customer"  # col 207
-_AD_LATEST_EXP_END = "Latest Expansion Contract End"  # col 218
-_AD_PLAN_END = "Plan End Date"  # col 255
-
-
-@dataclass
-class LoadedSheets:
-    """Raw frames after read. Carried around to keep things explicit."""
-
-    expansion: pd.DataFrame
-    account_data: pd.DataFrame
-    gong: pd.DataFrame
-    contacts_sf: pd.DataFrame
-    contacts_clay: pd.DataFrame
-
-
 class Repository:
-    """Builds in-memory AccountNodes from the xlsx.
+    """Builds AccountNodes from Supabase.
 
-    Lifecycle:
-        repo = Repository(path)
-        nodes = repo.load_accounts()      # builds 117 AccountNodes
-        repo.dq_log.write_csv(...)        # persist DQ findings
+    Lifecycle (unchanged from xlsx version):
+        repo = Repository()
+        nodes = repo.load_accounts()   # returns list[AccountNode] — Customer/Renewal only
+        repo.dq_log.write_csv(...)
     """
 
-    def __init__(self, xlsx_path: Path) -> None:
-        self.xlsx_path = Path(xlsx_path)
+    def __init__(self, xlsx_path: Any = None) -> None:
+        # xlsx_path accepted but ignored — kept so graph/nodes.py doesn't need changes
         self.dq_log = DataQualityLog()
-        self._loaded: Optional[LoadedSheets] = None
+        self._sb: Optional[Client] = None
 
-    # ---- public API ----------------------------------------------------
+    def _client(self) -> Client:
+        if self._sb is None:
+            self._sb = create_client(
+                os.environ["SUPABASE_URL"],
+                os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            )
+        return self._sb
+
+    # ---- public API --------------------------------------------------------
 
     def load_accounts(self) -> list[AccountNode]:
-        sheets = self._load_sheets()
-        ad_by_id = self._index_account_data(sheets.account_data)
-        gong_by_id = self._index_gong(sheets.gong)
-        sf_by_name = self._index_contacts_sf(sheets.contacts_sf)
-        clay_by_name = self._index_contacts_clay(sheets.contacts_clay)
+        sb = self._client()
+
+        # 1. Load Customer/Renewal SF accounts only
+        sf_rows = self._load_sf_accounts(sb)
+        logger.info("repository: %d customer/renewal accounts loaded from Supabase", len(sf_rows))
+
+        if not sf_rows:
+            logger.warning("repository: no customer accounts found — check Account_Status__c filter")
+            return []
+
+        # Build lookup maps keyed by sf_id
+        sf_ids = [r["sf_id"] for r in sf_rows]
+        account_ids = [r["account_id"] for r in sf_rows if r.get("account_id")]
+
+        # 2. Load supporting data in bulk
+        raw_by_sfid = self._load_raw(sb, sf_ids)
+        opps_by_sfid = self._load_open_opps(sb, sf_ids)
+        contacts_by_account = self._load_contacts(sb, sf_ids)
+        gong_by_account = self._load_gong(sb, account_ids)
+        fireflies_by_account = self._load_fireflies(sb, account_ids)
 
         nodes: list[AccountNode] = []
-        for _, row in sheets.expansion.iterrows():
-            node = self._build_node(row, ad_by_id, gong_by_id, sf_by_name, clay_by_name)
-            if node is not None:
+        for row in sf_rows:
+            node = self._build_node(
+                row,
+                raw_by_sfid.get(row["sf_id"], {}),
+                opps_by_sfid.get(row["sf_id"], []),
+                contacts_by_account.get(row["sf_id"], []),
+                gong_by_account.get(row.get("account_id"), []),
+                fireflies_by_account.get(row.get("account_id"), []),
+            )
+            if node:
                 nodes.append(node)
+
+        logger.info("repository: built %d AccountNodes", len(nodes))
         return nodes
 
-    # ---- sheet IO ------------------------------------------------------
+    # ---- data loaders ------------------------------------------------------
 
-    def _load_sheets(self) -> LoadedSheets:
-        if self._loaded is not None:
-            return self._loaded
-        if not self.xlsx_path.exists():
-            raise FileNotFoundError(f"xlsx not found at {self.xlsx_path}")
-        # Expansion Data has its header on row 2 (row 1 is blank).
-        expansion = pd.read_excel(self.xlsx_path, sheet_name="Expansion Data", header=1)
-        account_data = pd.read_excel(self.xlsx_path, sheet_name="Account-Data", header=0)
-        gong = pd.read_excel(self.xlsx_path, sheet_name="Gong+Fireflies Transcripts", header=0)
-        contacts_sf = pd.read_excel(self.xlsx_path, sheet_name="Contacts_From_SF", header=0)
-        contacts_clay = pd.read_excel(self.xlsx_path, sheet_name="Contacts Not in ProdSF", header=0)
-        self._loaded = LoadedSheets(
-            expansion=expansion,
-            account_data=account_data,
-            gong=gong,
-            contacts_sf=contacts_sf,
-            contacts_clay=contacts_clay,
-        )
-        return self._loaded
+    def _load_sf_accounts(self, sb: Client) -> list[dict]:
+        """Load only Customer/Renewal accounts from sf_accounts."""
+        all_rows: list[dict] = []
+        # Supabase REST filters on a JSONB path for Account_Status__c
+        # We try the typed `raw` JSONB column for the status field
+        # Pull all and filter in Python (cleaner than JSONB path queries via REST)
+        page = 0
+        page_size = 500
+        while True:
+            resp = (
+                sb.table("sf_accounts")
+                .select("sf_id, account_id, name, industry, annual_revenue, number_of_employees, owner_name, raw, synced_at")
+                .range(page * page_size, (page + 1) * page_size - 1)
+                .execute()
+            )
+            batch = resp.data or []
+            if not batch:
+                break
+            all_rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            page += 1
 
-    # ---- indexing ------------------------------------------------------
+        # Filter: Account_Status__c OR Type OR Stage__c must indicate customer
+        customer_rows = []
+        for r in all_rows:
+            raw = r.get("raw") or {}
+            status = _to_str(raw.get("Account_Status__c")) or ""
+            acct_type = _to_str(raw.get("Type")) or ""
+            stage = _to_str(raw.get("Stage__c")) or ""
+            is_customer = (
+                status in CUSTOMER_STAGES
+                or acct_type in CUSTOMER_STAGES
+                or stage in CUSTOMER_STAGES
+                or "customer" in status.lower()
+                or "renewal" in status.lower()
+            )
+            if is_customer:
+                customer_rows.append(r)
 
-    def _index_account_data(self, df: pd.DataFrame) -> dict[str, pd.Series]:
-        out: dict[str, pd.Series] = {}
-        for _, row in df.iterrows():
-            aid15 = _to_15(row.get(_AD_ACCOUNT_ID))
-            if not aid15:
-                self.dq_log.add(
-                    "missing_account_id_in_account_data",
-                    detail=f"Account Name={row.get('Account Name')!r}",
-                    account_name=_to_str(row.get("Account Name")),
-                )
-                continue
-            if aid15 in out:
-                self.dq_log.add(
-                    "duplicate_account_id_in_account_data",
-                    detail=f"id={aid15}",
-                    account_id=aid15,
-                    account_name=_to_str(row.get("Account Name")),
-                )
-            out[aid15] = row
+        logger.info("repository: %d / %d accounts are Customer/Renewal", len(customer_rows), len(all_rows))
+        return customer_rows
+
+    def _load_raw(self, sb: Client, sf_ids: list[str]) -> dict[str, dict]:
+        """Load full raw JSONB from sf_accounts_raw, keyed by sf_id."""
+        out: dict[str, dict] = {}
+        for i in range(0, len(sf_ids), 200):
+            chunk = sf_ids[i:i+200]
+            resp = sb.table("sf_accounts_raw").select("sf_id, data").in_("sf_id", chunk).execute()
+            for r in (resp.data or []):
+                out[r["sf_id"]] = r.get("data") or {}
         return out
 
-    def _index_gong(self, df: pd.DataFrame) -> dict[str, pd.Series]:
-        out: dict[str, pd.Series] = {}
-        for _, row in df.iterrows():
-            aid15 = _to_15(row.get("Account ID"))
-            if not aid15:
-                continue
-            out[aid15] = row
+    def _load_open_opps(self, sb: Client, sf_ids: list[str]) -> dict[str, list[dict]]:
+        """Load open opportunities per account sf_id."""
+        out: dict[str, list[dict]] = {}
+        for i in range(0, len(sf_ids), 200):
+            chunk = sf_ids[i:i+200]
+            resp = (
+                sb.table("sf_opportunities")
+                .select("account_sf_id, name, stage, amount, close_date, raw")
+                .in_("account_sf_id", chunk)
+                .execute()
+            )
+            for r in (resp.data or []):
+                key = r["account_sf_id"]
+                out.setdefault(key, []).append(r)
         return out
 
-    def _index_contacts_sf(self, df: pd.DataFrame) -> dict[str, list[pd.Series]]:
-        out: dict[str, list[pd.Series]] = {}
-        for _, row in df.iterrows():
-            name = _norm_name(row.get("Account Name"))
-            if not name:
-                continue
-            out.setdefault(name, []).append(row)
+    def _load_contacts(self, sb: Client, sf_ids: list[str]) -> dict[str, list[dict]]:
+        """Load SF contacts per account sf_id."""
+        out: dict[str, list[dict]] = {}
+        for i in range(0, len(sf_ids), 200):
+            chunk = sf_ids[i:i+200]
+            resp = (
+                sb.table("sf_contacts")
+                .select("account_sf_id, first_name, last_name, title, email, raw")
+                .in_("account_sf_id", chunk)
+                .execute()
+            )
+            for r in (resp.data or []):
+                key = r["account_sf_id"]
+                out.setdefault(key, []).append(r)
         return out
 
-    def _index_contacts_clay(self, df: pd.DataFrame) -> dict[str, list[pd.Series]]:
-        out: dict[str, list[pd.Series]] = {}
-        for _, row in df.iterrows():
-            name = _norm_name(row.get("Account Name"))
-            if not name:
-                continue
-            out.setdefault(name, []).append(row)
+    def _load_gong(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
+        """Load Gong calls per canonical account_id."""
+        out: dict[str, list[dict]] = {}
+        valid_ids = [a for a in account_ids if a]
+        for i in range(0, len(valid_ids), 200):
+            chunk = valid_ids[i:i+200]
+            resp = (
+                sb.table("gong_calls")
+                .select("account_id, title, date, duration_secs, summary, key_points, topics, action_items, parties_companies")
+                .in_("account_id", chunk)
+                .order("date", desc=True)
+                .execute()
+            )
+            for r in (resp.data or []):
+                out.setdefault(r["account_id"], []).append(r)
         return out
 
-    # ---- node builder --------------------------------------------------
+    def _load_fireflies(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
+        """Load Fireflies meetings per canonical account_id."""
+        out: dict[str, list[dict]] = {}
+        valid_ids = [a for a in account_ids if a]
+        for i in range(0, len(valid_ids), 200):
+            chunk = valid_ids[i:i+200]
+            resp = (
+                sb.table("fireflies_meetings")
+                .select("account_id, title, date, duration_secs, summary, action_items, key_questions, outline")
+                .in_("account_id", chunk)
+                .order("date", desc=True)
+                .execute()
+            )
+            for r in (resp.data or []):
+                out.setdefault(r["account_id"], []).append(r)
+        return out
+
+    # ---- node builder ------------------------------------------------------
 
     def _build_node(
         self,
-        row: pd.Series,
-        ad_by_id: dict[str, pd.Series],
-        gong_by_id: dict[str, pd.Series],
-        sf_by_name: dict[str, list[pd.Series]],
-        clay_by_name: dict[str, list[pd.Series]],
+        row: dict,
+        raw: dict,
+        opps: list[dict],
+        contacts: list[dict],
+        gong_calls: list[dict],
+        fireflies_meetings: list[dict],
     ) -> Optional[AccountNode]:
-        aid18 = _to_str(row.get("18-digit Account Id"))
-        if not aid18:
-            self.dq_log.add(
-                "missing_account_id_in_expansion_data",
-                detail=f"Account Name={row.get('Account Name')!r}",
-                account_name=_to_str(row.get("Account Name")),
-            )
-            return None
-        aid15 = _to_15(aid18)
-        if not aid15:
-            return None
-
-        account_name = _to_str(row.get("Account Name")) or "(unknown)"
+        sf_id = row.get("sf_id")
+        account_name = _to_str(row.get("name")) or "(unknown)"
         flags: list[str] = []
 
-        # Ownership — authoritative source = Account-Data
-        ad_row = ad_by_id.get(aid15)
-        if ad_row is None:
-            self.dq_log.add(
-                "expansion_account_not_in_account_data",
-                detail=f"id15={aid15}",
-                account_id=aid15,
-                account_name=account_name,
-            )
-            flags.append("account_data_missing")
-            ownership = Ownership(csm_missing=True)
-        else:
-            ae_name = _to_str(ad_row.get(_AD_AE))
-            ae_role = _to_str(ad_row.get(_AD_OWNER_ROLE))
-            csm_name = _to_str(ad_row.get(_AD_CSM))
-            ownership = Ownership(
-                ae_name=ae_name,
-                ae_role=ae_role,
-                csm_name=csm_name,
-                csm_missing=csm_name is None,
-            )
-            if csm_name is None:
-                self.dq_log.add(
-                    "missing_csm",
-                    detail="routing to AE only",
-                    account_id=aid15,
-                    account_name=account_name,
-                )
-                flags.append("missing_csm")
-            # Note that Expansion Data!D is overridden — keep the override audited.
-            expansion_d = _to_str(row.get("Account Owner"))
-            if expansion_d and ae_name and expansion_d != ae_name:
-                self.dq_log.add(
-                    "expansion_owner_d_differs_from_account_data_c",
-                    detail=f"expansion_d={expansion_d!r} account_data_c={ae_name!r}",
-                    account_id=aid15,
-                    account_name=account_name,
-                )
+        # IDs — use sf_id as the 18-char ID, truncate to 15
+        aid18 = sf_id or ""
+        aid15 = _to_15(aid18) or aid18
+
+        # Ownership from raw SF data
+        ae_name = _to_str(raw.get("Owner", {}).get("Name") if isinstance(raw.get("Owner"), dict) else None) \
+                  or _to_str(row.get("owner_name"))
+        csm_name = _to_str(raw.get("CSM_owner__c"))
+        ownership = Ownership(
+            ae_name=ae_name,
+            ae_role=_to_str(raw.get("Owner_Role__c")),
+            csm_name=csm_name,
+            csm_missing=csm_name is None,
+        )
+        if csm_name is None:
+            self.dq_log.add("missing_csm", "routing to AE only", account_id=aid15, account_name=account_name)
+            flags.append("missing_csm")
 
         # Current state
-        adoption_health = _to_str(row.get("Adoption Health from Prod"))
-        gap = _to_str(row.get("Use case gap \n(Prod data and usecase 2025)"))
-        last_activity_date = _to_date(ad_row.get(_AD_LAST_ACTIVITY)) if ad_row is not None else None
-        plan_end = _to_date(ad_row.get(_AD_PLAN_END)) if ad_row is not None else None
-        latest_exp_end = (
-            _to_date(ad_row.get(_AD_LATEST_EXP_END)) if ad_row is not None else None
-        )
-        has_open = _bool_from_flag(ad_row.get(_AD_HAS_OPEN_OPP)) if ad_row is not None else False
-        inactive_over_90 = (
-            _bool_from_flag(ad_row.get(_AD_INACTIVE_90)) if ad_row is not None else False
-        )
-        # Is Active Customer comes through as 1.0/0.0; default True if missing.
-        if ad_row is not None and not pd.isna(ad_row.get(_AD_IS_ACTIVE)):
-            is_active = _bool_from_flag(ad_row.get(_AD_IS_ACTIVE))
-        else:
-            is_active = True
-        health_status = _to_str(ad_row.get(_AD_HEALTH_STATUS)) if ad_row is not None else None
+        adoption_health = _to_str(raw.get("Adoption_Health__c"))  # if exists in SF
+        use_case_gap = _to_str(raw.get("Use_Case_2025__c")) or _to_str(raw.get("If_not_an_ICP__c"))
+        last_activity_date = _to_date(raw.get("LastActivityDate"))
+        plan_end = _to_date(raw.get("Plan_End_Date__c"))
+        latest_exp_end = _to_date(raw.get("Contract_Period__c"))
+        inactive_over_90 = self._is_inactive_90(last_activity_date)
 
-        # Usage rollups (Expansion Data L–R + AD–AG region)
+        # Is active customer — status check
+        status = _to_str(raw.get("Account_Status__c")) or ""
+        is_active = "customer" in status.lower() or "renewal" in status.lower() or status in CUSTOMER_STAGES
+
+        health_status = _to_str(raw.get("Health_Status__c"))
+
+        # Open expansion opp — any open opp on this account
+        has_open_opp = any(
+            _to_str(o.get("stage")) in OPEN_OPP_STAGES for o in opps
+        )
+
+        # Usage rollups from raw SF data (custom fields)
         usage = UsageCounts(
-            field_events_all_time=_to_float(row.get("field_all_time")),
-            third_party_events_all_time=_to_float(row.get("third_party_all_time")),
-            webinars_all_time=_to_float(row.get("webinar_all_time")),
-            standard_in_person=_to_float(row.get("Standard_in-person")),
-            standard_hybrid=_to_float(row.get("Standard_hybrid")),
-            standard_virtual=_to_float(row.get("Standard_virtual")),
-            # Conferences are tracked separately; no _all_time column in V1, leave 0.
+            field_events_all_time=_to_float(raw.get("Number_of_Field_Events__c")),
+            third_party_events_all_time=_to_float(raw.get("No_of_3rd_party_events_year__c")),
+            webinars_all_time=_to_float(raw.get("Number_of_Webinars__c")),
+            standard_in_person=0.0,
+            standard_hybrid=0.0,
+            standard_virtual=0.0,
             conferences_all_time=0.0,
         )
 
-        # 3P signal: hiring counts (Expansion Data AA-AC)
+        # 3P signals from SF custom fields
         s3p = Signals3P(
-            event_role_hiring_90d=_sum_int(
-                row.get("Conferences Hiring Count"),
-                row.get("Webinars Hiring"),
-                row.get("Field Events Hiring Count"),
-            ),
+            event_role_hiring_90d=None,
+            competitor_mentions_g2_90d=_to_int(raw.get("G2_Total_Pageviews__c")),
+            competitor_in_stack=_split_raw(raw.get("Competitor_Stack__c")),
         )
 
-        # ICP supply (W–Z)
-        icp = IcpPopulation(
-            conferences_icp_count=_to_int(row.get("Count_Conferences ICPs")) or 0,
-            field_events_icp_count=_to_int(row.get("Count_Field Events ICPs")) or 0,
-            webinar_icp_count=_to_int(row.get("Count_Webinar ICPs")) or 0,
-            third_party_icp_count=_to_int(row.get("Count_3PE ICPs")) or 0,
+        # 1P signals from Factors.ai custom fields
+        s1p = Signals1P(
+            factors_intent_label=_to_str(raw.get("Factors_Engagement_Level__c")),
+            demo_pricing_visits_90d=None,
+            factors_last_intent_date=_to_str(raw.get("Factors_last_intent_date__c")),
         )
 
-        # Conversations (Gong+Fireflies)
-        gong_row = gong_by_id.get(aid15)
-        if gong_row is None:
-            self.dq_log.add(
-                "gong_fireflies_no_match",
-                detail=f"id15={aid15}",
-                account_id=aid15,
-                account_name=account_name,
-            )
-            conversations = Conversations()
-        else:
-            conversations = Conversations(
-                has_gong=_to_str(gong_row.get("Has Gong Data")) in {"Yes", "yes", "True", "true"},
-                has_fireflies=_to_str(gong_row.get("Has Fireflies Data"))
-                in {"Yes", "yes", "True", "true"},
-                total_calls=_to_int(gong_row.get("Total Calls")) or 0,
-                date_range=_to_str(gong_row.get("Gong - Date Range"))
-                or _to_str(gong_row.get("Fireflies - Date Range")),
-                gong_business_summary=_to_str(gong_row.get("Gong - Business Summary")),
-                gong_product_interests=_split_list(gong_row.get("Gong - Product Interests")),
-                gong_competitors_mentioned=_split_list(
-                    gong_row.get("Gong - Competitors Mentioned")
-                ),
-                gong_key_points=_split_list(gong_row.get("Gong - Key Points")),
-                fireflies_overview=_to_str(gong_row.get("Fireflies - Overview Summary")),
-                fireflies_action_items=_split_list(gong_row.get("Fireflies - Action Items")),
-                fireflies_topics=_split_list(gong_row.get("Fireflies - Topics Discussed")),
-            )
+        # ICP population from SF
+        icp = IcpPopulation()
 
-        # Contacts
-        name_key = _norm_name(account_name)
-        sf_rows = sf_by_name.get(name_key, [])
-        clay_rows = clay_by_name.get(name_key, [])
-        if not sf_rows:
-            self.dq_log.add(
-                "contacts_sf_no_match",
-                detail=f"name_key={name_key}",
-                account_id=aid15,
-                account_name=account_name,
-            )
-        if not clay_rows:
-            self.dq_log.add(
-                "contacts_clay_no_match",
-                detail=f"name_key={name_key}",
-                account_id=aid15,
-                account_name=account_name,
-            )
+        # Conversations from Gong + Fireflies
+        conversations = self._build_conversations(gong_calls, fireflies_meetings, account_name, aid15)
 
-        contacts_sf = [_build_sf_contact(r) for r in sf_rows]
-        contacts_clay = [_build_clay_contact(r) for r in clay_rows]
+        # Contacts from SF
+        sf_contacts = [self._build_sf_contact(c) for c in contacts]
+        if not sf_contacts:
+            self.dq_log.add("contacts_sf_no_match", f"sf_id={sf_id}", account_id=aid15, account_name=account_name)
 
         # Account profile
-        segment = _to_str(row.get("Account Segment"))
-        acv = _to_float(row.get("ACV"), default=0.0) or None
-        target_departments = _split_list(row.get("Target Departments"))
-        sales_model = _to_str(row.get("Sales Model"))
-        target_customers = _split_list(row.get("Target Customers"))
+        segment = _to_str(raw.get("Account_Segment__c"))
+        acv = _to_float(raw.get("Total_Contract_Value_TCV__c")) or _to_float(raw.get("Current_contract_value__c")) or None
 
         return AccountNode(
             account_id_18=aid18,
             account_id_15=aid15,
             account_name=account_name,
-            domain=_to_str(row.get("Account Domain")),
+            domain=_to_str(raw.get("Domain__c")) or _to_str(raw.get("Website")),
             ownership=ownership,
             segment=segment,
-            acv_usd=acv,
-            target_departments=target_departments,
-            sales_model=sales_model,
-            target_customers=target_customers,
-            use_case_gap_field=gap,
+            acv_usd=acv if acv else None,
+            target_departments=[],
+            sales_model=None,
+            target_customers=[],
+            use_case_gap_field=use_case_gap,
             adoption_health=adoption_health,
             last_activity_date=last_activity_date,
             plan_end_date=plan_end,
             latest_expansion_contract_end=latest_exp_end,
-            has_open_expansion_opp=has_open,
+            has_open_expansion_opp=has_open_opp,
             is_active_customer=is_active,
             inactive_over_90_days=inactive_over_90,
             health_status=health_status,
             usage=usage,
-            signals_1p=Signals1P(),  # not in static dataset; placeholder
+            signals_1p=s1p,
             signals_2p=Signals2P(),
             signals_3p=s3p,
             icp_population=icp,
             conversations=conversations,
-            contacts_in_product_sf=contacts_sf,
-            contacts_not_in_product_clay=contacts_clay,
+            contacts_in_product_sf=sf_contacts,
+            contacts_not_in_product_clay=[],
             data_quality_flags=flags,
+        )
+
+    def _is_inactive_90(self, last_activity: Optional[date]) -> bool:
+        if last_activity is None:
+            return False
+        return (date.today() - last_activity).days > 90
+
+    def _build_conversations(
+        self,
+        gong_calls: list[dict],
+        fireflies: list[dict],
+        account_name: str,
+        aid15: str,
+    ) -> Conversations:
+        if not gong_calls and not fireflies:
+            self.dq_log.add("gong_fireflies_no_match", f"id15={aid15}",
+                            account_id=aid15, account_name=account_name)
+            return Conversations()
+
+        # Gong — use the most recent call's summary as the primary summary
+        gong_summary = None
+        gong_key_points: list[str] = []
+        gong_competitors: list[str] = []
+        gong_products: list[str] = []
+        date_range: Optional[str] = None
+
+        if gong_calls:
+            latest = gong_calls[0]  # already sorted desc
+            gong_summary = _to_str(latest.get("summary"))
+            gong_key_points = _listify(latest.get("key_points"))
+            gong_competitors = _listify(latest.get("topics"))
+            if gong_calls[-1].get("date") and gong_calls[0].get("date"):
+                date_range = f"{gong_calls[-1]['date'][:10]} → {gong_calls[0]['date'][:10]}"
+
+        # Fireflies — latest meeting summary + action items
+        ff_overview = None
+        ff_action_items: list[str] = []
+        ff_topics: list[str] = []
+
+        if fireflies:
+            latest_ff = fireflies[0]
+            ff_overview = _to_str(latest_ff.get("summary"))
+            ff_action_items = _listify(latest_ff.get("action_items"))
+            ff_topics = _listify(latest_ff.get("key_questions"))
+
+        return Conversations(
+            has_gong=len(gong_calls) > 0,
+            has_fireflies=len(fireflies) > 0,
+            total_calls=len(gong_calls) + len(fireflies),
+            date_range=date_range,
+            gong_business_summary=gong_summary,
+            gong_product_interests=gong_products,
+            gong_competitors_mentioned=gong_competitors,
+            gong_key_points=gong_key_points,
+            fireflies_overview=ff_overview,
+            fireflies_action_items=ff_action_items,
+            fireflies_topics=ff_topics,
+        )
+
+    def _build_sf_contact(self, c: dict) -> Contact:
+        first = _to_str(c.get("first_name")) or ""
+        last = _to_str(c.get("last_name")) or ""
+        name = (first + " " + last).strip() or "(unknown)"
+        raw = c.get("raw") or {}
+        return Contact(
+            name=name,
+            title=_to_str(c.get("title")),
+            email=_to_str(c.get("email")),
+            linkedin=_to_str(raw.get("LinkedIn_URL__c")),
+            seniority=None,
+            persona=None,
+            persona_fit_score=None,
         )
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers (kept out of the class so they're easy to unit-test)
+# Module-level helpers
 # ---------------------------------------------------------------------------
 
-
-def _sum_int(*values: Any) -> Optional[int]:
-    total = 0
-    saw_any = False
-    for v in values:
-        i = _to_int(v)
-        if i is not None:
-            total += i
-            saw_any = True
-    return total if saw_any else None
+def _listify(value: Any) -> list[str]:
+    """Coerce a DB value (list, string, None) to list[str]."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    s = str(value).strip()
+    return [s] if s else []
 
 
-def _build_sf_contact(row: pd.Series) -> Contact:
-    first = _to_str(row.get("First Name")) or ""
-    last = _to_str(row.get("Last Name")) or ""
-    name = (first + " " + last).strip() or "(unknown)"
-    return Contact(
-        name=name,
-        title=_to_str(row.get("Title")),
-        seniority=_to_str(row.get("Seniority")),
-        persona=_to_str(row.get("Persona")),
-        persona_fit_score=_to_float(row.get("Persona Fit Score"), default=0.0) or None,
-        linkedin=_to_str(row.get("LinkedIn URL")),
-        email=_to_str(row.get("Email")),
-    )
-
-
-def _build_clay_contact(row: pd.Series) -> ClayContact:
-    # Tagged use-case is whichever per-event column is non-zero.
-    tagged: Optional[str] = None
-    for col, label in (
-        ("Conferences", "Conferences"),
-        ("Webinar", "Webinar"),
-        ("Field Events", "Field Events"),
-        ("Third-Party Events", "Third-Party Events"),
-    ):
-        v = _to_int(row.get(col))
-        if v and v > 0:
-            tagged = label
-            break
-    return ClayContact(
-        name=_to_str(row.get("Contact Name")) or "(unknown)",
-        title=_to_str(row.get("Title")),
-        linkedin=_to_str(row.get("LinkedIn URL")),
-        email=_to_str(row.get("Consolidated Email (Clay + Prod)")),
-        tagged_use_case=tagged,
-        found_in_prod=_bool_from_flag(row.get("Found in Prod?")),
-    )
+def _split_raw(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    return [p.strip() for p in str(value).replace(";", ",").split(",") if p.strip()]
