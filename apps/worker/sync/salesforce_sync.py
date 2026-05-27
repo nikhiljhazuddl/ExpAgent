@@ -238,18 +238,31 @@ def sync_accounts(
             row["industry"] = r["Industry"]
         acct_rows.append((sf_id, domain, r.get("Name"), owner_name, r.get("Industry"), full))
 
+    # Deduplicate domains — unique constraint means only one account can own a domain.
+    # For duplicate domains (subsidiaries), clear domain on all but the first occurrence.
+    seen_domains: set[str] = set()
+    # Also pre-load existing domain→sf_id from DB so we don't stomp existing links
+    existing_domain_r = sb.table("accounts").select("domain, sf_id").not_.is_("domain", "null").execute()
+    for row in (existing_domain_r.data or []):
+        if row.get("domain"):
+            seen_domains.add(row["domain"])
+
     log.info("sf: bulk-upserting %d rows into accounts table…", len(acct_rows))
     for i in range(0, len(acct_rows), WRITE_CHUNK):
         chunk = acct_rows[i:i + WRITE_CHUNK]
-        sb.table("accounts").upsert(
-            [{"sf_id": sf_id, "name": name or sf_id,
-              **( {"domain": dom, "email_domain": dom} if dom else {}),
-              **({"owner_name": own} if own else {}),
-              **({"industry": ind} if ind else {}),
-             }
-             for sf_id, dom, name, own, ind, _ in chunk],
-            on_conflict="sf_id",
-        ).execute()
+        rows_to_upsert = []
+        for sf_id, dom, name, own, ind, _ in chunk:
+            row: dict = {"sf_id": sf_id, "name": name or sf_id}
+            if dom and dom not in seen_domains:
+                row["domain"] = dom
+                row["email_domain"] = dom
+                seen_domains.add(dom)
+            if own:
+                row["owner_name"] = own
+            if ind:
+                row["industry"] = ind
+            rows_to_upsert.append(row)
+        sb.table("accounts").upsert(rows_to_upsert, on_conflict="sf_id").execute()
 
     log.info("sf: accounts table updated — fetching back account_id mappings…")
 
