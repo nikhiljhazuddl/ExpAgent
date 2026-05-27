@@ -213,7 +213,11 @@ def sync_accounts(
                 id_to_extra[sf_id].update(_clean(er))
         log.info("sf: merged extra batch of %d fields", len(batch))
 
-    # Merge and persist
+    # Merge and persist — build rows first, then bulk-upsert in chunks of 250
+    WRITE_CHUNK = 250
+    typed_rows: list[dict] = []
+    raw_rows: list[dict] = []
+
     for r in records:
         sf_id = r["Id"]
         full: dict[str, Any] = {**_clean(r), **id_to_extra.get(sf_id, {})}
@@ -233,8 +237,7 @@ def sync_accounts(
             },
         )
 
-        # Typed summary table
-        sb.table("sf_accounts").upsert({
+        typed_rows.append({
             "sf_id": sf_id, "account_id": uid,
             "name": r.get("Name"), "industry": r.get("Industry"),
             "annual_revenue": r.get("AnnualRevenue"),
@@ -242,16 +245,24 @@ def sync_accounts(
             "owner_name": owner_name,
             "raw": full,
             "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
-
-        # Full raw store
-        sb.table("sf_accounts_raw").upsert({
+        })
+        raw_rows.append({
             "sf_id": sf_id, "account_id": uid,
             "data": full,
             "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
+        })
 
-    log.info("sf: upserted %d accounts", len(records))
+    # Bulk upsert in chunks to avoid Supabase HTTP/2 connection drops
+    for i in range(0, len(typed_rows), WRITE_CHUNK):
+        sb.table("sf_accounts").upsert(
+            typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id"
+        ).execute()
+        sb.table("sf_accounts_raw").upsert(
+            raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id"
+        ).execute()
+        log.info("sf: upserted accounts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
+
+    log.info("sf: upserted %d accounts total", len(records))
 
 
 def sync_opportunities(
@@ -274,24 +285,30 @@ def sync_opportunities(
             if sf_id in id_to_extra:
                 id_to_extra[sf_id].update(_clean(er))
 
+    WRITE_CHUNK = 250
+    typed_rows: list[dict] = []
+    raw_rows: list[dict] = []
     for r in records:
         sf_id = r["Id"]
         full = {**_clean(r), **id_to_extra.get(sf_id, {})}
         acct_uid = resolver.resolve(sf_id=r.get("AccountId")) if r.get("AccountId") else None
-
-        sb.table("sf_opportunities").upsert({
+        typed_rows.append({
             "sf_id": sf_id, "account_sf_id": r.get("AccountId"), "account_id": acct_uid,
             "name": r.get("Name"), "stage": r.get("StageName"),
             "amount": r.get("Amount"), "close_date": r.get("CloseDate"), "type": r.get("Type"),
             "raw": full, "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
-
-        sb.table("sf_opportunities_raw").upsert({
+        })
+        raw_rows.append({
             "sf_id": sf_id, "account_id": acct_uid,
             "data": full, "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
+        })
 
-    log.info("sf: upserted %d opportunities", len(records))
+    for i in range(0, len(typed_rows), WRITE_CHUNK):
+        sb.table("sf_opportunities").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        sb.table("sf_opportunities_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        log.info("sf: upserted opportunities %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
+
+    log.info("sf: upserted %d opportunities total", len(records))
 
 
 def sync_contacts(
@@ -314,25 +331,15 @@ def sync_contacts(
             if sf_id in id_to_extra:
                 id_to_extra[sf_id].update(_clean(er))
 
-    people_rows = []
+    people_rows: list[dict] = []
+    typed_rows: list[dict] = []
+    raw_rows: list[dict] = []
     for r in records:
         sf_id = r["Id"]
         full = {**_clean(r), **id_to_extra.get(sf_id, {})}
         acct_uid = resolver.resolve(
             sf_id=r.get("AccountId"), email=r.get("Email"),
         ) if (r.get("AccountId") or r.get("Email")) else None
-
-        sb.table("sf_contacts").upsert({
-            "sf_id": sf_id, "account_sf_id": r.get("AccountId"), "account_id": acct_uid,
-            "first_name": r.get("FirstName"), "last_name": r.get("LastName"),
-            "title": r.get("Title"), "email": r.get("Email"),
-            "raw": full, "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
-
-        sb.table("sf_contacts_raw").upsert({
-            "sf_id": sf_id, "account_id": acct_uid,
-            "data": full, "synced_at": _now(),
-        }, on_conflict="sf_id").execute()
 
         full_name = f"{r.get('FirstName', '')} {r.get('LastName', '')}".strip()
         if full_name or r.get("Email"):
@@ -346,11 +353,27 @@ def sync_contacts(
                 "source": "salesforce",
                 "sf_contact_id": sf_id,
             })
+        typed_rows.append({
+            "sf_id": sf_id, "account_sf_id": r.get("AccountId"), "account_id": acct_uid,
+            "first_name": r.get("FirstName"), "last_name": r.get("LastName"),
+            "title": r.get("Title"), "email": r.get("Email"),
+            "raw": full, "synced_at": _now(),
+        })
+        raw_rows.append({
+            "sf_id": sf_id, "account_id": acct_uid,
+            "data": full, "synced_at": _now(),
+        })
+
+    WRITE_CHUNK = 250
+    for i in range(0, len(typed_rows), WRITE_CHUNK):
+        sb.table("sf_contacts").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        sb.table("sf_contacts_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        log.info("sf: upserted contacts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
     if people_rows:
-        for i in range(0, len(people_rows), 200):
-            sb.table("people").upsert(people_rows[i:i+200], on_conflict="sf_contact_id").execute()
-    log.info("sf: upserted %d contacts / people", len(records))
+        for i in range(0, len(people_rows), 250):
+            sb.table("people").upsert(people_rows[i:i+250], on_conflict="sf_contact_id").execute()
+    log.info("sf: upserted %d contacts / people total", len(records))
 
 
 # ── Main entry ────────────────────────────────────────────────────────────────
