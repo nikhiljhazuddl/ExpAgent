@@ -239,13 +239,20 @@ def sync_accounts(
         acct_rows.append((sf_id, domain, r.get("Name"), owner_name, r.get("Industry"), full))
 
     # Deduplicate domains — unique constraint means only one account can own a domain.
-    # For duplicate domains (subsidiaries), clear domain on all but the first occurrence.
+    # Pre-load ALL existing domains from DB (paginated — default limit is 1000).
     seen_domains: set[str] = set()
-    # Also pre-load existing domain→sf_id from DB so we don't stomp existing links
-    existing_domain_r = sb.table("accounts").select("domain, sf_id").not_.is_("domain", "null").execute()
-    for row in (existing_domain_r.data or []):
-        if row.get("domain"):
-            seen_domains.add(row["domain"])
+    _offset = 0
+    while True:
+        existing_domain_r = (sb.table("accounts").select("domain")
+                             .not_.is_("domain", "null")
+                             .range(_offset, _offset + 999).execute())
+        for row in (existing_domain_r.data or []):
+            if row.get("domain"):
+                seen_domains.add(row["domain"])
+        if len(existing_domain_r.data or []) < 1000:
+            break
+        _offset += 1000
+    log.info("sf: pre-loaded %d existing domains to skip duplicates", len(seen_domains))
 
     log.info("sf: bulk-upserting %d rows into accounts table…", len(acct_rows))
     for i in range(0, len(acct_rows), WRITE_CHUNK):
