@@ -213,35 +213,70 @@ def sync_accounts(
                 id_to_extra[sf_id].update(_clean(er))
         log.info("sf: merged extra batch of %d fields", len(batch))
 
-    # Merge and persist — build rows first, then bulk-upsert in chunks of 250
+    # ── Step 1: Bulk-upsert into canonical `accounts` table by sf_id ──────────
+    # This is fast: one upsert per 250 rows, no per-row resolver calls.
+    # We use sf_id as the conflict key so re-runs are idempotent.
     WRITE_CHUNK = 250
-    typed_rows: list[dict] = []
-    raw_rows: list[dict] = []
-
+    acct_rows: list[dict] = []
     for r in records:
         sf_id = r["Id"]
         full: dict[str, Any] = {**_clean(r), **id_to_extra.get(sf_id, {})}
-
         domain = normalise_domain(r.get("Website"))
         owner_name = None
         if isinstance(r.get("Owner"), dict):
             owner_name = r["Owner"].get("Name")
+        row: dict = {
+            "sf_id": sf_id,
+            "name": r.get("Name") or sf_id,
+        }
+        if domain:
+            row["domain"] = domain
+            row["email_domain"] = domain
+        if owner_name:
+            row["owner_name"] = owner_name
+        if r.get("Industry"):
+            row["industry"] = r["Industry"]
+        acct_rows.append((sf_id, domain, r.get("Name"), owner_name, r.get("Industry"), full))
 
-        uid = resolver.resolve(
-            name=r.get("Name"),
-            domain=domain,
-            sf_id=sf_id,
-            extra_fields={
-                "industry":   r.get("Industry"),
-                "owner_name": owner_name,
-            },
-        )
+    log.info("sf: bulk-upserting %d rows into accounts table…", len(acct_rows))
+    for i in range(0, len(acct_rows), WRITE_CHUNK):
+        chunk = acct_rows[i:i + WRITE_CHUNK]
+        sb.table("accounts").upsert(
+            [{"sf_id": sf_id, "name": name or sf_id,
+              **( {"domain": dom, "email_domain": dom} if dom else {}),
+              **({"owner_name": own} if own else {}),
+              **({"industry": ind} if ind else {}),
+             }
+             for sf_id, dom, name, own, ind, _ in chunk],
+            on_conflict="sf_id",
+        ).execute()
 
+    log.info("sf: accounts table updated — fetching back account_id mappings…")
+
+    # ── Step 2: Fetch sf_id → account UUID mapping back in bulk ────────────
+    # Read back in pages so we can link sf_accounts / sf_accounts_raw correctly
+    sf_id_to_uid: dict[str, str] = {}
+    offset = 0
+    while True:
+        r2 = sb.table("accounts").select("id, sf_id").not_.is_("sf_id", "null") \
+            .range(offset, offset + 999).execute()
+        for row in (r2.data or []):
+            sf_id_to_uid[row["sf_id"]] = row["id"]
+        if len(r2.data or []) < 1000:
+            break
+        offset += 1000
+    log.info("sf: loaded %d sf_id→uuid mappings", len(sf_id_to_uid))
+
+    # ── Step 3: Bulk-upsert sf_accounts + sf_accounts_raw ──────────────────
+    typed_rows: list[dict] = []
+    raw_rows: list[dict] = []
+    for sf_id, domain, name, owner_name, industry, full in acct_rows:
+        uid = sf_id_to_uid.get(sf_id)
         typed_rows.append({
             "sf_id": sf_id, "account_id": uid,
-            "name": r.get("Name"), "industry": r.get("Industry"),
-            "annual_revenue": r.get("AnnualRevenue"),
-            "number_of_employees": r.get("NumberOfEmployees"),
+            "name": name, "industry": industry,
+            "annual_revenue": full.get("AnnualRevenue"),
+            "number_of_employees": full.get("NumberOfEmployees"),
             "owner_name": owner_name,
             "raw": full,
             "synced_at": _now(),
@@ -252,14 +287,9 @@ def sync_accounts(
             "synced_at": _now(),
         })
 
-    # Bulk upsert in chunks to avoid Supabase HTTP/2 connection drops
     for i in range(0, len(typed_rows), WRITE_CHUNK):
-        sb.table("sf_accounts").upsert(
-            typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id"
-        ).execute()
-        sb.table("sf_accounts_raw").upsert(
-            raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id"
-        ).execute()
+        sb.table("sf_accounts").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        sb.table("sf_accounts_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
         log.info("sf: upserted accounts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
     log.info("sf: upserted %d accounts total", len(records))
