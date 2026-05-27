@@ -1,0 +1,47 @@
+name: GTM Mesh — Data Sync
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours (free tier friendly)
+  workflow_dispatch:          # also lets you trigger manually from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+      SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
+      SF_USERNAME: ${{ secrets.SF_USERNAME }}
+      SF_PASSWORD: ${{ secrets.SF_PASSWORD }}
+      SF_SECURITY_TOKEN: ${{ secrets.SF_SECURITY_TOKEN }}
+      SF_LOGIN_URL: ${{ secrets.SF_LOGIN_URL }}
+      GONG_BASE_URL: ${{ secrets.GONG_BASE_URL }}
+      GONG_ACCESS_KEY: ${{ secrets.GONG_ACCESS_KEY }}
+      GONG_SECRET_KEY: ${{ secrets.GONG_SECRET_KEY }}
+      FIREFLIES_API_KEY: ${{ secrets.FIREFLIES_API_KEY }}
+      PYLON_API_KEY: ${{ secrets.PYLON_API_KEY }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          cd apps/worker
+          pip install -e .
+
+      - name: Run full sync
+        run: |
+          cd apps/worker
+          python run_sync.py --sf --gong --fireflies --pylon --linear
