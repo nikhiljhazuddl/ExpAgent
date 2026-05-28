@@ -44,38 +44,55 @@ def _get(path: str, params: dict | None = None) -> dict | list:
 
 
 def _fetch_accounts() -> dict[str, dict]:
-    """Return {pylon_account_id: account_dict} for domain-based matching."""
+    """Return {pylon_account_id: account_dict} for domain-based matching.
+
+    Pylon uses cursor-based pagination via pagination.cursor / has_next_page.
+    The 'page' param does NOT work — always returns same first page.
+    """
     results: dict[str, dict] = {}
-    page = 1
+    cursor: str | None = None
     while True:
-        data = _get("/accounts", {"limit": 100, "page": page})
+        params: dict = {"limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        data = _get("/accounts", params)
         items = data.get("data", []) if isinstance(data, dict) else []
         for a in items:
             results[a["id"]] = a
-        if len(items) < 100:
+        pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+        if not pagination.get("has_next_page"):
             break
-        page += 1
+        cursor = pagination.get("cursor")
+        if not cursor:
+            break
     log.info("pylon: fetched %d accounts for matching", len(results))
     return results
 
 
 def _fetch_issues_window(start: datetime, end: datetime) -> list[dict]:
-    """Fetch all issues in a time window (≤28 days)."""
+    """Fetch all issues in a time window (≤28 days).
+
+    Pylon uses cursor-based pagination — 'page' param does NOT work.
+    """
     results: list[dict] = []
-    page = 1
+    cursor: str | None = None
     while True:
-        params = {
+        params: dict = {
             "limit": 100,
-            "page": page,
             "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "end_time": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        if cursor:
+            params["cursor"] = cursor
         data = _get("/issues", params)
         items = data.get("data", []) if isinstance(data, dict) else []
         results.extend(items)
-        if len(items) < 100:
+        pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+        if not pagination.get("has_next_page"):
             break
-        page += 1
+        cursor = pagination.get("cursor")
+        if not cursor:
+            break
     return results
 
 
