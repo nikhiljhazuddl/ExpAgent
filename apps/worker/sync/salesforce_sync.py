@@ -425,15 +425,15 @@ def sync_contacts(
             "data": full, "synced_at": _now(),
         })
 
-    WRITE_CHUNK = 250
+    WRITE_CHUNK = 50   # contacts have large JSONB — smaller chunks to avoid statement timeout
     for i in range(0, len(typed_rows), WRITE_CHUNK):
         # sf_contacts table dropped — raw only
         sb.table("sf_contacts_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
         log.info("sf: upserted contacts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
     if people_rows:
-        for i in range(0, len(people_rows), 250):
-            sb.table("people").upsert(people_rows[i:i+250], on_conflict="sf_contact_id").execute()
+        for i in range(0, len(people_rows), 100):
+            sb.table("people").upsert(people_rows[i:i+100], on_conflict="sf_contact_id").execute()
     log.info("sf: upserted %d contacts / people total", len(records))
 
 
