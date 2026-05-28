@@ -308,7 +308,7 @@ def sync_accounts(
         })
 
     for i in range(0, len(typed_rows), WRITE_CHUNK):
-        sb.table("sf_accounts").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        # sf_accounts table dropped — raw only
         sb.table("sf_accounts_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
         log.info("sf: upserted accounts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
@@ -354,7 +354,7 @@ def sync_opportunities(
         })
 
     for i in range(0, len(typed_rows), WRITE_CHUNK):
-        sb.table("sf_opportunities").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        # sf_opportunities table dropped — raw only
         sb.table("sf_opportunities_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
         log.info("sf: upserted opportunities %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
@@ -427,7 +427,7 @@ def sync_contacts(
 
     WRITE_CHUNK = 250
     for i in range(0, len(typed_rows), WRITE_CHUNK):
-        sb.table("sf_contacts").upsert(typed_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
+        # sf_contacts table dropped — raw only
         sb.table("sf_contacts_raw").upsert(raw_rows[i:i + WRITE_CHUNK], on_conflict="sf_id").execute()
         log.info("sf: upserted contacts %d–%d / %d", i + 1, min(i + WRITE_CHUNK, len(typed_rows)), len(typed_rows))
 
