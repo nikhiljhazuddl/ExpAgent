@@ -186,13 +186,14 @@ class Repository:
         account_ids = [r["account_id"] for r in sf_rows if r.get("account_id")]
 
         # 2. Load all supporting data in bulk
-        raw_by_sfid     = self._load_raw(sb, sf_ids)
-        opps_by_sfid    = self._load_open_opps(sb, sf_ids)
-        contacts_by_sf  = self._load_contacts(sb, sf_ids)
-        gong_by_account = self._load_gong(sb, account_ids)
-        ff_by_account   = self._load_fireflies(sb, account_ids)
+        # NOTE: sf_opportunities_raw and sf_contacts_raw use account_id (UUID), not sf_id
+        raw_by_sfid      = self._load_raw(sb, sf_ids)
+        opps_by_acct     = self._load_open_opps(sb, account_ids)
+        contacts_by_acct = self._load_contacts(sb, account_ids)
+        gong_by_account  = self._load_gong(sb, account_ids)
+        ff_by_account    = self._load_fireflies(sb, account_ids)
         # Pylon: CSM assignee per account
-        csm_by_account  = self._load_pylon_csm(sb, account_ids)
+        csm_by_account   = self._load_pylon_csm(sb, account_ids)
 
         nodes: list[AccountNode] = []
         for row in sf_rows:
@@ -201,8 +202,8 @@ class Repository:
             node = self._build_node(
                 row,
                 raw_by_sfid.get(sf_id, {}),
-                opps_by_sfid.get(sf_id, []),
-                contacts_by_sf.get(sf_id, []),
+                opps_by_acct.get(acct_id, []),
+                contacts_by_acct.get(acct_id, []),
                 gong_by_account.get(acct_id, []),
                 ff_by_account.get(acct_id, []),
                 csm_by_account.get(acct_id),
@@ -216,29 +217,44 @@ class Repository:
     # ---- data loaders ------------------------------------------------------
 
     def _load_sf_accounts(self, sb: Client) -> list[dict]:
-        """Load Customer/Renewal accounts WHERE use_case_gap__c is not null."""
-        all_rows: list[dict] = []
+        """Load Customer/Renewal accounts WHERE use_case_gap__c is not null.
+
+        Reads from sf_accounts_raw (sf_accounts typed table was dropped).
+        Joins to accounts table to get the canonical account_id UUID.
+        """
+        # Step 1: load all raw SF account data
+        all_raw: list[dict] = []
         page, page_size = 0, 500
         while True:
             resp = (
-                sb.table("sf_accounts")
-                .select("sf_id, account_id, name, raw")
+                sb.table("sf_accounts_raw")
+                .select("sf_id, data")
                 .range(page * page_size, (page + 1) * page_size - 1)
                 .execute()
             )
             batch = resp.data or []
             if not batch:
                 break
-            all_rows.extend(batch)
+            all_raw.extend(batch)
             if len(batch) < page_size:
                 break
             page += 1
 
+        # Step 2: bulk-load sf_id → account UUID mapping from accounts table
+        sf_to_uuid: dict[str, str] = {}
+        for i in range(0, len(all_raw), 500):
+            chunk_ids = [r["sf_id"] for r in all_raw[i:i+500]]
+            r2 = sb.table("accounts").select("id, sf_id").in_("sf_id", chunk_ids).execute()
+            for row in (r2.data or []):
+                sf_to_uuid[row["sf_id"]] = row["id"]
+
+        # Step 3: filter to Customer/Renewal with use_case_gap__c populated
         customer_with_gap = []
-        for r in all_rows:
-            raw = r.get("raw") or {}
+        for r in all_raw:
+            raw = r.get("data") or {}
+            sf_id = r["sf_id"]
             # Customer/Renewal filter
-            status   = (_to_str(raw.get("Account_Status__c")) or "").lower()
+            status    = (_to_str(raw.get("Account_Status__c")) or "").lower()
             acct_type = (_to_str(raw.get("Type")) or "").lower()
             is_customer = "customer" in status or "renewal" in status or \
                           "customer" in acct_type or "renewal" in acct_type
@@ -248,11 +264,16 @@ class Repository:
             gap = _to_str(raw.get("use_case_gap__c")) or _to_str(raw.get("Use_Case_Gap__c"))
             if not gap:
                 continue
-            r["_gap"] = gap  # cache for _build_node
-            customer_with_gap.append(r)
+            customer_with_gap.append({
+                "sf_id":      sf_id,
+                "account_id": sf_to_uuid.get(sf_id),
+                "name":       _to_str(raw.get("Name")),
+                "raw":        raw,
+                "_gap":       gap,
+            })
 
         logger.info("repository: %d / %d accounts are Customer/Renewal with gap",
-                    len(customer_with_gap), len(all_rows))
+                    len(customer_with_gap), len(all_raw))
         return customer_with_gap
 
     def _load_raw(self, sb: Client, sf_ids: list[str]) -> dict[str, dict]:
@@ -264,32 +285,59 @@ class Repository:
                 out[r["sf_id"]] = r.get("data") or {}
         return out
 
-    def _load_open_opps(self, sb: Client, sf_ids: list[str]) -> dict[str, list[dict]]:
+    def _load_open_opps(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
+        """Load from sf_opportunities_raw (typed table was dropped).
+        Keyed by account_id UUID (not sf_id).
+        """
         out: dict[str, list[dict]] = {}
-        for i in range(0, len(sf_ids), 200):
-            chunk = sf_ids[i:i+200]
+        valid = [a for a in account_ids if a]
+        for i in range(0, len(valid), 200):
+            chunk = valid[i:i+200]
             resp = (
-                sb.table("sf_opportunities")
-                .select("account_sf_id, name, stage, amount, close_date")
-                .in_("account_sf_id", chunk)
+                sb.table("sf_opportunities_raw")
+                .select("sf_id, account_id, data")
+                .in_("account_id", chunk)
                 .execute()
             )
             for r in (resp.data or []):
-                out.setdefault(r["account_sf_id"], []).append(r)
+                data = r.get("data") or {}
+                acct = r.get("account_id")
+                row = {
+                    "account_id": acct,
+                    "name":       data.get("Name"),
+                    "stage":      data.get("StageName"),
+                    "amount":     data.get("Amount"),
+                    "close_date": data.get("CloseDate"),
+                }
+                out.setdefault(acct, []).append(row)
         return out
 
-    def _load_contacts(self, sb: Client, sf_ids: list[str]) -> dict[str, list[dict]]:
+    def _load_contacts(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
+        """Load from sf_contacts_raw (typed table was dropped).
+        Keyed by account_id UUID (not sf_id).
+        """
         out: dict[str, list[dict]] = {}
-        for i in range(0, len(sf_ids), 200):
-            chunk = sf_ids[i:i+200]
+        valid = [a for a in account_ids if a]
+        for i in range(0, len(valid), 200):
+            chunk = valid[i:i+200]
             resp = (
-                sb.table("sf_contacts")
-                .select("account_sf_id, first_name, last_name, title, email, raw")
-                .in_("account_sf_id", chunk)
+                sb.table("sf_contacts_raw")
+                .select("sf_id, account_id, data")
+                .in_("account_id", chunk)
                 .execute()
             )
             for r in (resp.data or []):
-                out.setdefault(r["account_sf_id"], []).append(r)
+                data = r.get("data") or {}
+                acct = r.get("account_id")
+                row = {
+                    "account_id": acct,
+                    "first_name": data.get("FirstName"),
+                    "last_name":  data.get("LastName"),
+                    "title":      data.get("Title"),
+                    "email":      data.get("Email"),
+                    "raw":        data,
+                }
+                out.setdefault(acct, []).append(row)
         return out
 
     def _load_gong(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:

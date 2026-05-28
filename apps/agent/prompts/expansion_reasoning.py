@@ -134,7 +134,7 @@ Otherwise return:
   "missing_use_case": "Webinar | Field Events | Third-Party Events | Conferences",
   "confidence": 0.0,
   "priority_band": "high | medium | low",
-  "recommended_action_owner": "AE | CSM | BOTH",
+  "recommended_action_owner": "CSM",
   "ownership": {
     "ae": {"name": "string", "role": "string"},
     "csm": {"name": "string"}
