@@ -21,7 +21,7 @@ class RunConfig:
     max_concurrency: int = 8
     limit: Optional[int] = None  # cap number of LLM calls (debug)
     model: Optional[str] = None
-    per_role_cap: int = 5  # top N per AE / per CSM
+    per_role_cap: int = 10  # top N per AE / per CSM (was 5 — bumped per product decision)
 
 
 @dataclass

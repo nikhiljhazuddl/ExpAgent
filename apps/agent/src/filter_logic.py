@@ -98,12 +98,13 @@ def dq5_inactive(node: AccountNode) -> Optional[DQHit]:
 
 
 # Order matters — first hit wins (so the funnel splits cleanly per the spec table).
+# DQ5 (inactive) removed per product decision — inactivity should not disqualify.
+# An account can still be a real expansion target even if it has been quiet.
 DQ_ORDER = (
     ("DQ1", dq1_red_adoption),
     ("DQ2", dq2_recent_activity),
     ("DQ3", dq3_named_open_opp),
     ("DQ4", dq4_open_opp_flag),
-    ("DQ5", dq5_inactive),
 )
 
 
@@ -289,7 +290,6 @@ class FilterResult:
             ("DQ2", "DQ2_recent_activity"),
             ("DQ3", "DQ3_named_open_opp"),
             ("DQ4", "DQ4_open_opp_flag"),
-            ("DQ5", "DQ5_inactive"),
         ]
         running = len(self.triggered)
         out: dict[str, int] = {

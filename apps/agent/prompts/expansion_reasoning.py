@@ -31,11 +31,22 @@ A signal without ontology grounding is not a signal — it is a guess.
 
 DECISION PROCEDURE (apply in order)
 
-1. CONFIRM THE GAP IS REAL.
-   - Cross-check use_case_gap_field (Expansion Data col K) against usage columns L-R (should be 0 or near-zero).
-   - Cross-check against Gong/Fireflies (they may have run the use case via workaround).
-   - Check for false-positive expansion patterns (aspirational language, no budget, no hire).
-   - If false-positive, return is_signal=false with reasoning_trace.
+1. TRUST THE USE CASE GAP AS THE SOURCE OF TRUTH.
+   - `use_case_gap_field` (Expansion Data col K) is the AUTHORITATIVE source of which use cases
+     are missing. It is set deliberately by CSMs and ops based on the customer's current contract
+     and subscriptions.
+   - DO NOT cross-check it against usage columns L-R to "verify" it. A customer may show historical
+     usage of a use case for two valid reasons:
+        (a) they used it long ago but are no longer subscribed/active on it, OR
+        (b) they ran a short trial/pilot without purchasing it.
+     In both cases, the gap is REAL regardless of historical usage numbers.
+   - DO NOT return is_signal=false because "the customer already has X webinars in their usage
+     data". That logic is wrong. If the gap field lists a use case, treat it as a confirmed gap.
+   - The ONLY valid reasons to return is_signal=false are:
+        • The account has no ownership, no contacts, no conversation data AND no ontology
+          mapping is possible (rare — almost never)
+        • A churn indicator is so severe that expansion is reckless (CHURN-* present + Red health)
+     Otherwise, treat the gap as real and produce the signal.
 
 2. MAP TO ONTOLOGY ENTITIES + SALES MODEL.
    - Pick exactly one expansion_entity_id (EXP-001..EXP-007) that fits the gap.

@@ -1,0 +1,59 @@
+[2026-05-28 03:48:16] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 03:48:16] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 03:48:18] sf_accounts_raw count: 2516
+[2026-05-28 03:48:18] sf_accounts_raw count: 2516
+[2026-05-28 03:53:19] sf_accounts_raw count: 2516
+[2026-05-28 03:53:19] sf_accounts_raw count: 2516
+[2026-05-28 03:58:21] sf_accounts_raw count: 2516
+[2026-05-28 03:58:21] sf_accounts_raw count: 2516
+[2026-05-28 04:03:22] sf_accounts_raw count: 2516
+[2026-05-28 04:03:22] sf_accounts_raw count: 2516
+[2026-05-28 04:08:23] sf_accounts_raw count: 2516
+[2026-05-28 04:08:23] sf_accounts_raw count: 2516
+[2026-05-28 04:13:24] sf_accounts_raw count: 2516
+[2026-05-28 04:13:24] sf_accounts_raw count: 2516
+[2026-05-28 04:18:25] sf_accounts_raw count: 2874
+[2026-05-28 04:18:25] sf_accounts_raw count: 2874
+[2026-05-28 04:23:27] sf_accounts_raw count: 2913
+[2026-05-28 04:23:27] sf_accounts_raw count: 2913
+[2026-05-28 04:23:27] ⚠️  Sync process not running — restarting SF + Pylon sync...
+[2026-05-28 04:23:27] ⚠️  Sync process not running — restarting SF + Pylon sync...
+[2026-05-28 04:23:27] Sync restarted (PID 62290).
+[2026-05-28 04:23:27] Sync restarted (PID 62290).
+[2026-05-28 04:35:17] sf_accounts_raw count: 2913
+[2026-05-28 04:35:17] sf_accounts_raw count: 2913
+[2026-05-28 04:40:18] sf_accounts_raw count: 2913
+[2026-05-28 04:40:18] sf_accounts_raw count: 2913
+[2026-05-28 04:40:19] ⚠️  Sync process not running — restarting SF + Pylon sync...
+[2026-05-28 04:40:19] ⚠️  Sync process not running — restarting SF + Pylon sync...
+[2026-05-28 04:40:19] Sync restarted (PID 63981).
+[2026-05-28 04:40:19] Sync restarted (PID 63981).
+[2026-05-28 04:42:23] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 04:42:23] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 04:42:24] sf_accounts_raw count: 2913
+[2026-05-28 04:42:24] sf_accounts_raw count: 2913
+[2026-05-28 04:47:25] sf_accounts_raw count: 2913
+[2026-05-28 04:47:25] sf_accounts_raw count: 2913
+[2026-05-28 04:48:28] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 04:48:28] === Watcher started. Will run agent when sf_accounts_raw >= 20000 rows ===
+[2026-05-28 04:48:29] sf_accounts_raw count: 2913
+[2026-05-28 04:48:29] sf_accounts_raw count: 2913
+[2026-05-28 04:53:30] sf_accounts_raw count: 2913
+[2026-05-28 04:53:30] sf_accounts_raw count: 2913
+[2026-05-28 04:58:31] sf_accounts_raw count: 2913
+[2026-05-28 04:58:31] sf_accounts_raw count: 2913
+[2026-05-28 05:03:33] sf_accounts_raw count: 2913
+[2026-05-28 05:03:33] sf_accounts_raw count: 2913
+[2026-05-28 05:08:34] sf_accounts_raw count: 2913
+[2026-05-28 05:08:34] sf_accounts_raw count: 2913
+[2026-05-28 05:13:38] sf_accounts_raw count: 20000
+[2026-05-28 05:13:38] sf_accounts_raw count: 20000
+[2026-05-28 05:13:38] ✅ Sync threshold reached (20000 accounts). Running agent...
+[2026-05-28 05:13:38] ✅ Sync threshold reached (20000 accounts). Running agent...
+[2026-05-28 05:13:38] Running Gong + Fireflies sync first...
+[2026-05-28 05:13:38] Running Gong + Fireflies sync first...
+[2026-05-28 05:15:16] Conversation sync done.
+[2026-05-28 05:15:16] Running agent (cli.py run)...
+watch_and_run.sh: line 41: cd: ./apps/agent: No such file or directory
+[2026-05-28 05:15:16] ⚠️  Agent exited with code 1. Check ./watch_and_run.log for details.
+[2026-05-28 05:15:16] === Watcher done ===

@@ -195,6 +195,8 @@ class Repository:
         linear_by_account = self._load_linear(sb, account_ids)
         # Pylon: CSM assignee per account
         csm_by_account    = self._load_pylon_csm(sb, account_ids)
+        # SF Users: resolve CSM_owner__c / OwnerId → human name
+        self._sf_users    = self._load_sf_users(sb)
 
         nodes: list[AccountNode] = []
         for row in sf_rows:
@@ -374,6 +376,25 @@ class Repository:
                 out.setdefault(r["account_id"], []).append(r)
         return out
 
+    def _load_sf_users(self, sb: Client) -> dict[str, str]:
+        """Bulk-load SF user_id → name lookup for CSM/AE resolution."""
+        out: dict[str, str] = {}
+        try:
+            page = 0
+            while True:
+                r = sb.table("sf_users").select("id, name").range(page*1000, (page+1)*1000 - 1).execute()
+                rows = r.data or []
+                for row in rows:
+                    if row.get("id") and row.get("name"):
+                        out[row["id"]] = row["name"]
+                if len(rows) < 1000:
+                    break
+                page += 1
+            logger.info("repository: loaded %d SF user names for CSM/AE resolution", len(out))
+        except Exception as e:
+            logger.warning("repository: sf_users table missing or unreadable (%s) — CSM IDs will show raw", e)
+        return out
+
     def _load_linear(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
         """Return up to 10 most recent Linear issues per account, keyed by account_id UUID."""
         out: dict[str, list[dict]] = {}
@@ -436,7 +457,14 @@ class Repository:
         use_case_gap = row.get("_gap") or _to_str(raw.get("use_case_gap__c")) or _to_str(raw.get("Use_Case_Gap__c"))
 
         # ── CSM ownership (Pylon first, SF fallback) ──────────────────────
-        csm_name = pylon_csm or _to_str(raw.get("CSM_owner__c")) or _to_str(raw.get("CSM_Owner__c"))
+        # SF CSM_owner__c is a User Id — resolve to human name via sf_users lookup
+        users = getattr(self, "_sf_users", {}) or {}
+        sf_csm_id = _to_str(raw.get("CSM_owner__c")) or _to_str(raw.get("CSM_Owner__c"))
+        sf_csm_name = users.get(sf_csm_id) if sf_csm_id else None
+        # Final fallback: account OwnerId
+        owner_id = _to_str(raw.get("OwnerId"))
+        owner_name = users.get(owner_id) if owner_id else None
+        csm_name = pylon_csm or sf_csm_name or owner_name
         if not csm_name:
             self.dq_log.add("missing_csm", "no Pylon assignee and no SF CSM_owner__c",
                             account_id=aid15, account_name=acct_name)

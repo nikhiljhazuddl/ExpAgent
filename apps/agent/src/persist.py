@@ -217,13 +217,12 @@ def persist_run(state: AgentState) -> dict:
         })
 
     # output/run_summary.json — the dashboard payload for RevOps
+    # (per product decision: do not surface "disqualified" counts to end users)
     funnel = {
         "total": len(all_accounts),
         "triggered": len(triggered),
         "survivors": len(survivors),
-        "disqualified": len(notifications),
         "signals_kept": sum(1 for s in signals if s.is_signal),
-        "signals_dropped": sum(1 for s in signals if not s.is_signal),
     }
     from collections import Counter
     dq_breakdown = Counter(n.disqualifier_rule for n in notifications)
@@ -256,7 +255,73 @@ def persist_run(state: AgentState) -> dict:
     runs_list.sort(key=lambda r: r["triggered_at"], reverse=True)
     _write_json(runs_index, {"runs": runs_list})
 
+    # ---- Persist to Supabase so deployed API (Render/Vercel) can read -------
+    try:
+        _persist_to_supabase(
+            run_id=run_id,
+            triggered_at=triggered_at,
+            funnel=funnel,
+            kept_signals=kept_signals,
+            capped_by_ae=capped_by_ae,
+            capped_by_csm=capped_by_csm,
+            extras_by_ae=extras_by_ae,
+            extras_by_csm=extras_by_csm,
+        )
+    except Exception as e:
+        # Persisting to Supabase is best-effort. Disk is the source of truth.
+        import logging
+        logging.getLogger("persist").warning("supabase persist failed: %s", e)
+
     return {"run_id": run_id, "funnel": funnel}
+
+
+def _persist_to_supabase(*, run_id, triggered_at, funnel, kept_signals,
+                          capped_by_ae, capped_by_csm, extras_by_ae, extras_by_csm):
+    """Upsert one row per agent run into Supabase `agent_runs` (JSONB columns).
+
+    The deployed API reads the latest row from this table.
+    Table schema (run once in Supabase SQL editor):
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            run_id          TEXT PRIMARY KEY,
+            generated_at    TIMESTAMPTZ NOT NULL,
+            signals         JSONB NOT NULL DEFAULT '[]'::jsonb,
+            queues_by_ae    JSONB NOT NULL DEFAULT '{}'::jsonb,
+            queues_by_csm   JSONB NOT NULL DEFAULT '{}'::jsonb,
+            run_summary     JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+    """
+    import os
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    if not (url and key):
+        return
+    from supabase import create_client
+    sb = create_client(url, key)
+
+    sigs_payload = [_signal_to_payload(s, run_id) for s in kept_signals]
+    queues_ae_payload = {
+        ae: {
+            "signals": [_signal_to_payload(s, run_id) for s in sigs],
+            "extras":  [_signal_to_payload(s, run_id) for s in extras_by_ae.get(ae, [])],
+        }
+        for ae, sigs in capped_by_ae.items()
+    }
+    queues_csm_payload = {
+        csm: {
+            "signals": [_signal_to_payload(s, run_id) for s in sigs],
+            "extras":  [_signal_to_payload(s, run_id) for s in extras_by_csm.get(csm, [])],
+        }
+        for csm, sigs in capped_by_csm.items()
+    }
+
+    sb.table("agent_runs").upsert({
+        "run_id":        run_id,
+        "generated_at":  triggered_at.isoformat(),
+        "signals":       sigs_payload,
+        "queues_by_ae":  queues_ae_payload,
+        "queues_by_csm": queues_csm_payload,
+        "run_summary":   {"funnel": funnel},
+    }, on_conflict="run_id").execute()
 
 
 def _signal_to_payload(s: Signal, run_id: str) -> dict:

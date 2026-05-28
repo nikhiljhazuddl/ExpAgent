@@ -453,8 +453,39 @@ def run() -> None:
     sync_accounts(sb, resolver, instance_url, token, acct_fields)
     sync_opportunities(sb, resolver, instance_url, token, opp_fields)
     sync_contacts(sb, resolver, instance_url, token, cont_fields)
+    sync_users(sb, instance_url, token)
 
     log.info("salesforce sync complete")
+
+
+def sync_users(sb: Client, instance_url: str, token: str) -> None:
+    """Sync active SF Users so we can resolve CSM/Owner IDs to names."""
+    log.info("sf: syncing users…")
+    all_users: list[dict] = []
+    url = f"{instance_url}/services/data/v59.0/query"
+    q = "SELECT Id, Name, FirstName, LastName, Email, Title, IsActive FROM User WHERE IsActive = true"
+    r = httpx.get(url, headers={"Authorization": f"Bearer {token}"}, params={"q": q}, timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    all_users.extend(data.get("records", []))
+    while data.get("nextRecordsUrl"):
+        r = httpx.get(f"{instance_url}{data['nextRecordsUrl']}",
+                      headers={"Authorization": f"Bearer {token}"}, timeout=60)
+        data = r.json()
+        all_users.extend(data.get("records", []))
+
+    rows = [{
+        "id":         u["Id"],
+        "name":       u.get("Name"),
+        "first_name": u.get("FirstName"),
+        "last_name":  u.get("LastName"),
+        "email":      u.get("Email"),
+        "title":      u.get("Title"),
+    } for u in all_users]
+
+    for i in range(0, len(rows), 200):
+        sb.table("sf_users").upsert(rows[i:i+200], on_conflict="id").execute()
+    log.info("sf: upserted %d users", len(rows))
 
 
 if __name__ == "__main__":
