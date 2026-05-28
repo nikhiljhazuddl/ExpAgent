@@ -117,7 +117,9 @@ def build_context(
         acv_usd=node.acv_usd,
         current_state=CurrentState(
             adoption_health=node.adoption_health,
-            active_use_cases_in_prod=_active_use_cases_from_usage(node),
+            # Removed — was misleading the LLM to "verify" gaps against historical usage.
+            # use_case_gap_field is the only source of truth for gaps.
+            active_use_cases_in_prod=[],
             use_case_gap_field=node.use_case_gap_field,
             renewal_proximity_days=_renewal_days(node, today),
             is_active_customer=node.is_active_customer,

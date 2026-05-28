@@ -29,6 +29,31 @@ A signal without ontology grounding is not a signal — it is a guess.
 {ONTOLOGY_PROMPT}
 ==========================================================================
 
+==========================================================================
+HARD RULES — VIOLATING THESE PRODUCES A WRONG ANSWER
+
+  RULE A: `use_case_gap_field` is the AUTHORITATIVE source of which use cases
+          the customer is missing / not subscribed to. Period.
+
+  RULE B: NEVER set is_signal=false because "usage data shows X events of
+          the gap use case." Historical event counts (Number_of_Webinars__c,
+          Number_of_Field_Events__c, etc.) are NOT proof of an active
+          subscription. They may reflect:
+              - Old usage from a previous, expired contract
+              - A short pilot or trial that did not convert
+              - Test events on a free tier
+          The gap field reflects the customer's CURRENT contract reality.
+          If the gap field lists a use case, it is genuinely missing.
+
+  RULE C: Reasoning traces that compare gap_field to usage columns and
+          conclude "no real gap" are FORBIDDEN. Do not write such reasoning.
+
+  RULE D: The only valid is_signal=false outcomes are (a) severe churn
+          indicators present alongside Red adoption, OR (b) the gap field
+          is itself empty (in which case the account should not have reached
+          this step at all).
+==========================================================================
+
 DECISION PROCEDURE (apply in order)
 
 1. TRUST THE USE CASE GAP AS THE SOURCE OF TRUTH.
