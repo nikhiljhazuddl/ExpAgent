@@ -381,15 +381,26 @@ def sync_contacts(
             if sf_id in id_to_extra:
                 id_to_extra[sf_id].update(_clean(er))
 
+    # Bulk-fetch AccountId → account UUID mapping (contacts link via AccountId)
+    _acct_sf_to_uid: dict[str, str] = {}
+    _off = 0
+    while True:
+        _r = sb.table("accounts").select("id, sf_id").not_.is_("sf_id", "null") \
+            .range(_off, _off + 999).execute()
+        for row in (_r.data or []):
+            _acct_sf_to_uid[row["sf_id"]] = row["id"]
+        if len(_r.data or []) < 1000:
+            break
+        _off += 1000
+    log.info("sf: loaded %d account sf_id→uuid for contacts linking", len(_acct_sf_to_uid))
+
     people_rows: list[dict] = []
     typed_rows: list[dict] = []
     raw_rows: list[dict] = []
     for r in records:
         sf_id = r["Id"]
         full = {**_clean(r), **id_to_extra.get(sf_id, {})}
-        acct_uid = resolver.resolve(
-            sf_id=r.get("AccountId"), email=r.get("Email"),
-        ) if (r.get("AccountId") or r.get("Email")) else None
+        acct_uid = _acct_sf_to_uid.get(r.get("AccountId", "")) if r.get("AccountId") else None
 
         full_name = f"{r.get('FirstName', '')} {r.get('LastName', '')}".strip()
         if full_name or r.get("Email"):
