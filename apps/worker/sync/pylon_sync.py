@@ -148,7 +148,6 @@ def sync(sb: Client, resolver: AccountResolver) -> None:
             "priority": (issue.get("custom_fields") or {}).get("priority", {}).get("value"),
             "category": issue.get("type"),
             "assignee_name": None,   # Pylon API doesn't expose name in issues list
-            "assignee_id": assignee_id,
             "reporter_email": reporter_email,
             "created_at": issue.get("created_at") or issue.get("createdAt"),
             "resolved_at": issue.get("resolved_at") or issue.get("resolvedAt"),
