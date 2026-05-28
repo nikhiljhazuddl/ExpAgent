@@ -83,6 +83,15 @@ class IcpPopulationCtx(BaseModel):
     third_party_icp_count: int = 0
 
 
+class LinearTicketCtx(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    title: Optional[str] = None
+    status: Optional[str] = None
+    priority: Optional[str] = None
+    assignee_name: Optional[str] = None
+
+
 class ConversationsCtx(BaseModel):
     model_config = ConfigDict(extra="forbid")
     has_gong: bool = False
@@ -96,6 +105,14 @@ class ConversationsCtx(BaseModel):
     fireflies_overview: Optional[str] = None
     fireflies_action_items: list[str] = Field(default_factory=list)
     fireflies_topics: list[str] = Field(default_factory=list)
+
+
+class LinearCtx(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    open_count: int = 0
+    in_progress_count: int = 0
+    done_count: int = 0
+    top_tickets: list[LinearTicketCtx] = Field(default_factory=list)
 
 
 class ContactCtx(BaseModel):
@@ -141,6 +158,7 @@ class AccountContext(BaseModel):
     icp_population: IcpPopulationCtx = Field(default_factory=IcpPopulationCtx)
 
     conversations: ConversationsCtx = Field(default_factory=ConversationsCtx)
+    linear: LinearCtx = Field(default_factory=LinearCtx)
 
     contacts_in_product_sf: list[ContactCtx] = Field(default_factory=list)
     contacts_not_in_product_clay: list[ClayContactCtx] = Field(default_factory=list)

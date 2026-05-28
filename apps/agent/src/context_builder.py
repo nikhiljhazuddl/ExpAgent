@@ -25,6 +25,8 @@ from schemas.account_context import (
     ConversationsCtx,
     CurrentState,
     IcpPopulationCtx,
+    LinearCtx,
+    LinearTicketCtx,
     OwnerRef,
     OwnershipCtx,
     Signals1PCtx,
@@ -171,6 +173,7 @@ def build_context(
             fireflies_action_items=node.conversations.fireflies_action_items,
             fireflies_topics=node.conversations.fireflies_topics,
         ),
+        linear=_build_linear_ctx(node.linear_issues),
         contacts_in_product_sf=contacts_sf,
         contacts_not_in_product_clay=contacts_clay,
         deterministic_priority_score=priority_score,
@@ -178,6 +181,24 @@ def build_context(
     )
 
     return _prune_to_cap(ctx)
+
+
+def _build_linear_ctx(issues: list[dict]) -> LinearCtx:
+    """Summarise Linear issues for the LLM context."""
+    open_count = sum(1 for i in issues if (i.get("status") or "").lower() in ("todo", "backlog", "in progress", "open"))
+    in_progress = sum(1 for i in issues if (i.get("status") or "").lower() == "in progress")
+    done_count  = sum(1 for i in issues if (i.get("status") or "").lower() in ("done", "completed", "cancelled"))
+    top = [
+        LinearTicketCtx(
+            id=i.get("id", ""),
+            title=i.get("title"),
+            status=i.get("status"),
+            priority=i.get("priority"),
+            assignee_name=i.get("assignee_name"),
+        )
+        for i in issues[:5]
+    ]
+    return LinearCtx(open_count=open_count, in_progress_count=in_progress, done_count=done_count, top_tickets=top)
 
 
 def _size_chars(ctx: AccountContext) -> int:

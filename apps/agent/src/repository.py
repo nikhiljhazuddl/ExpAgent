@@ -190,10 +190,11 @@ class Repository:
         raw_by_sfid      = self._load_raw(sb, sf_ids)
         opps_by_acct     = self._load_open_opps(sb, account_ids)
         contacts_by_acct = self._load_contacts(sb, account_ids)
-        gong_by_account  = self._load_gong(sb, account_ids)
-        ff_by_account    = self._load_fireflies(sb, account_ids)
+        gong_by_account   = self._load_gong(sb, account_ids)
+        ff_by_account     = self._load_fireflies(sb, account_ids)
+        linear_by_account = self._load_linear(sb, account_ids)
         # Pylon: CSM assignee per account
-        csm_by_account   = self._load_pylon_csm(sb, account_ids)
+        csm_by_account    = self._load_pylon_csm(sb, account_ids)
 
         nodes: list[AccountNode] = []
         for row in sf_rows:
@@ -204,6 +205,7 @@ class Repository:
                 raw_by_sfid.get(sf_id, {}),
                 opps_by_acct.get(acct_id, []),
                 contacts_by_acct.get(acct_id, []),
+                linear_by_account.get(acct_id, []),
                 gong_by_account.get(acct_id, []),
                 ff_by_account.get(acct_id, []),
                 csm_by_account.get(acct_id),
@@ -372,6 +374,25 @@ class Repository:
                 out.setdefault(r["account_id"], []).append(r)
         return out
 
+    def _load_linear(self, sb: Client, account_ids: list[str]) -> dict[str, list[dict]]:
+        """Return up to 10 most recent Linear issues per account, keyed by account_id UUID."""
+        out: dict[str, list[dict]] = {}
+        valid = [a for a in account_ids if a]
+        for i in range(0, len(valid), 200):
+            chunk = valid[i:i+200]
+            resp = (
+                sb.table("linear_issues")
+                .select("account_id, id, title, status, priority, assignee_name, created_at")
+                .in_("account_id", chunk)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            for r in (resp.data or []):
+                acct = r.get("account_id")
+                if acct:
+                    out.setdefault(acct, []).append(r)
+        return out
+
     def _load_pylon_csm(self, sb: Client, account_ids: list[str]) -> dict[str, Optional[str]]:
         """Return the most recent Pylon assignee name per account — this is the CSM."""
         out: dict[str, Optional[str]] = {}
@@ -401,6 +422,7 @@ class Repository:
         raw: dict,
         opps: list[dict],
         contacts: list[dict],
+        linear_issues: list[dict],
         gong_calls: list[dict],
         fireflies: list[dict],
         pylon_csm: Optional[str],
@@ -462,6 +484,10 @@ class Repository:
             competitor_in_stack        = _split_raw(raw.get("Competitor_Stack__c")),
         )
 
+        # ── Linear issues ────────────────────────────────────────────────
+        # Keep up to 10 most recent; already sorted desc by created_at
+        linear_top = linear_issues[:10]
+
         # ── Conversations (Gong + Fireflies) ──────────────────────────────
         conversations = self._build_conversations(gong_calls, fireflies, acct_name, aid15)
 
@@ -502,6 +528,7 @@ class Repository:
             signals_3p=s3p,
             icp_population=IcpPopulation(),
             conversations=conversations,
+            linear_issues=linear_top,
             contacts_in_product_sf=sf_contacts,
             contacts_not_in_product_clay=[],
             data_quality_flags=flags,

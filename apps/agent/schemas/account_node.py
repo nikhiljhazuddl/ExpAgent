@@ -155,6 +155,9 @@ class AccountNode(BaseModel):
     # Conversations
     conversations: Conversations = Field(default_factory=Conversations)
 
+    # Linear tickets linked to this account
+    linear_issues: list[dict] = Field(default_factory=list)
+
     # Contact pools
     contacts_in_product_sf: list[Contact] = Field(default_factory=list)
     contacts_not_in_product_clay: list[ClayContact] = Field(default_factory=list)

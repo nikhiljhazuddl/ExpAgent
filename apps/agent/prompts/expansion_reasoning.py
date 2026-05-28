@@ -81,6 +81,7 @@ DECISION PROCEDURE (apply in order)
        "Account-Data col 207 (Is Active Customer)"
        "Gong call summary" / "Gong competitors mentioned" / "Gong product interests"
        "Fireflies overview" / "Fireflies topics" / "Fireflies action items"
+       "Linear tickets — open/in-progress issues signal product friction or unmet needs"
        "Contacts_From_SF" / "Contacts Not in ProdSF (Clay)"
        "Zuddl ontology — [Sales-Led / Hybrid / PLG / Adoption Flywheel / Tool Consolidation / Persona P-### / etc.]"
    - explanation_why_prioritized: 3–4 bullets. Why this account is on top of the queue THIS week.
