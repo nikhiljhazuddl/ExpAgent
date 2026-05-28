@@ -266,6 +266,7 @@ def persist_run(state: AgentState) -> dict:
             capped_by_csm=capped_by_csm,
             extras_by_ae=extras_by_ae,
             extras_by_csm=extras_by_csm,
+            contexts=contexts,
         )
     except Exception as e:
         # Persisting to Supabase is best-effort. Disk is the source of truth.
@@ -276,7 +277,8 @@ def persist_run(state: AgentState) -> dict:
 
 
 def _persist_to_supabase(*, run_id, triggered_at, funnel, kept_signals,
-                          capped_by_ae, capped_by_csm, extras_by_ae, extras_by_csm):
+                          capped_by_ae, capped_by_csm, extras_by_ae, extras_by_csm,
+                          contexts=None):
     """Upsert one row per agent run into Supabase `agent_runs` (JSONB columns).
 
     The deployed API reads the latest row from this table.
@@ -322,6 +324,66 @@ def _persist_to_supabase(*, run_id, triggered_at, funnel, kept_signals,
         "queues_by_csm": queues_csm_payload,
         "run_summary":   {"funnel": funnel},
     }, on_conflict="run_id").execute()
+
+    # ---- Also write per-row signals to the `signals` table so the user
+    # can browse them in Supabase Table Editor.
+    signal_rows = []
+    for s in kept_signals:
+        owner_role = s.recommended_action_owner or "CSM"
+        owner_name = None
+        if s.ownership:
+            if owner_role == "AE" and s.ownership.ae:
+                owner_name = s.ownership.ae.name
+            elif s.ownership.csm:
+                owner_name = s.ownership.csm.name
+        signal_rows.append({
+            "id":                  f"{run_id}:{s.account_id}",
+            "run_id":              run_id,
+            "account_id":          s.account_id,
+            "account_name":        s.account_name,
+            "signal_type":         s.missing_use_case or "expansion",
+            "priority":            s.priority_band or "medium",
+            "owner_role":          owner_role,
+            "owner_name":          owner_name,
+            "headline":            (s.why_now or "")[:500],
+            "rationale":           s.business_logic or s.reasoning_trace,
+            "recommended_action":  (s.draft_outreach.subject if s.draft_outreach else None),
+            "evidence":            [c.model_dump() for c in (s.supporting_context or [])],
+            "metadata":            {
+                "confidence":       s.confidence,
+                "final_score":      s.final_score,
+                "priority_score":   s.priority_score,
+                "missing_use_case": s.missing_use_case,
+                "ontology":         s.ontology_grounding.model_dump() if s.ontology_grounding else None,
+                "draft_outreach":   s.draft_outreach.model_dump() if s.draft_outreach else None,
+                "who_to_target":    s.who_to_target.model_dump() if s.who_to_target else None,
+            },
+            "created_at":          triggered_at.isoformat(),
+        })
+    if signal_rows:
+        # Clear existing rows for this run (idempotent on re-run)
+        sb.table("signals").delete().eq("run_id", run_id).execute()
+        for i in range(0, len(signal_rows), 100):
+            sb.table("signals").upsert(signal_rows[i:i+100], on_conflict="id").execute()
+
+    # ---- Write per-account AccountContext snapshots so the user can audit
+    # the input data Claude saw for each signal.
+    ctx_rows = []
+    for aid, ctx in (contexts or {}).items():
+        try:
+            data = ctx.model_dump() if hasattr(ctx, "model_dump") else dict(ctx)
+        except Exception:
+            continue
+        ctx_rows.append({
+            "account_id": aid,
+            "run_id":     run_id,
+            "data":       data,
+            "updated_at": triggered_at.isoformat(),
+        })
+    if ctx_rows:
+        sb.table("account_contexts").delete().eq("run_id", run_id).execute()
+        for i in range(0, len(ctx_rows), 50):
+            sb.table("account_contexts").upsert(ctx_rows[i:i+50]).execute()
 
 
 def _signal_to_payload(s: Signal, run_id: str) -> dict:

@@ -171,15 +171,12 @@ async def score_one_node(payload: dict) -> dict:
 
 
 def cap_node(state: AgentState) -> dict:
-    """Apply per-AE and per-CSM caps; drop low-band signals from delivery.
+    """NO CAP — each CSM/AE sees every signal owned by them, ranked by final_score.
 
-    Returns:
-      - capped_by_ae / capped_by_csm: top-5 per role (the primary queue)
-      - extras_by_ae / extras_by_csm: ranks 6-10 per role (the "show 5 more" reveal)
+    Product decision: don't limit how many accounts a CSM sees. Show them all,
+    ordered by ranking. The frontend can paginate. "extras" lists are kept
+    empty for backward compatibility with the API shape.
     """
-    cfg = state["config"]
-    cap = cfg.per_role_cap
-    extras_cap = cap * 2  # ranks 6..10
     signals = state.get("signals") or []
 
     deliverable = [
@@ -189,36 +186,20 @@ def cap_node(state: AgentState) -> dict:
 
     by_ae: dict[str, list[Signal]] = {}
     by_csm: dict[str, list[Signal]] = {}
-    extras_ae: dict[str, list[Signal]] = {}
-    extras_csm: dict[str, list[Signal]] = {}
-
-    ae_seen: dict[str, int] = {}
-    csm_seen: dict[str, int] = {}
 
     for s in deliverable:
         ae = (s.ownership.ae.name if s.ownership and s.ownership.ae else None) or "_unassigned_"
         csm = (s.ownership.csm.name if s.ownership and s.ownership.csm else None) or "_unassigned_"
 
-        ae_idx = ae_seen.get(ae, 0)
-        if ae_idx < cap:
-            by_ae.setdefault(ae, []).append(s)
-        elif ae_idx < extras_cap:
-            extras_ae.setdefault(ae, []).append(s)
-        ae_seen[ae] = ae_idx + 1
-
+        by_ae.setdefault(ae, []).append(s)
         if csm != "_unassigned_":
-            csm_idx = csm_seen.get(csm, 0)
-            if csm_idx < cap:
-                by_csm.setdefault(csm, []).append(s)
-            elif csm_idx < extras_cap:
-                extras_csm.setdefault(csm, []).append(s)
-            csm_seen[csm] = csm_idx + 1
+            by_csm.setdefault(csm, []).append(s)
 
     return {
         "capped_by_ae": by_ae,
         "capped_by_csm": by_csm,
-        "extras_by_ae": extras_ae,
-        "extras_by_csm": extras_csm,
+        "extras_by_ae": {},
+        "extras_by_csm": {},
     }
 
 
