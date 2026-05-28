@@ -98,6 +98,37 @@ def _resolve_account_for_call(call: dict, resolver: AccountResolver) -> str | No
     return None
 
 
+def _fetch_transcripts(call_ids: list[str]) -> dict[str, list]:
+    """Fetch full transcripts for a batch of call IDs. Returns {call_id: [segments]}."""
+    if not call_ids:
+        return {}
+    result: dict[str, list] = {}
+    # Gong allows up to 20 call IDs per transcript request
+    for i in range(0, len(call_ids), 20):
+        batch = call_ids[i:i+20]
+        try:
+            data = _post("/v2/calls/transcript", {"filter": {"callIds": batch}})
+            for ct in data.get("callTranscripts", []):
+                cid = ct.get("callId")
+                if cid:
+                    # Flatten transcript segments into readable text per speaker turn
+                    result[cid] = ct.get("transcript", [])
+        except Exception as e:
+            log.warning("gong: transcript batch failed: %s", e)
+    return result
+
+
+def _transcript_to_text(segments: list) -> str:
+    """Convert transcript segments to readable plain text."""
+    lines = []
+    for seg in segments:
+        speaker = seg.get("speakerId", "Speaker")
+        sentences = " ".join(s.get("text", "") for s in seg.get("sentences", []))
+        if sentences.strip():
+            lines.append(f"[{speaker}] {sentences.strip()}")
+    return "\n".join(lines)
+
+
 def sync(sb: Client, resolver: AccountResolver, days_back: int = 90) -> None:
     to_dt = datetime.utcnow()
     from_dt = to_dt - timedelta(days=days_back)
@@ -105,6 +136,12 @@ def sync(sb: Client, resolver: AccountResolver, days_back: int = 90) -> None:
 
     calls = _fetch_calls(from_dt.isoformat() + "Z", to_dt.isoformat() + "Z")
     log.info("gong: %d calls to process", len(calls))
+
+    # Fetch transcripts for all calls
+    all_call_ids = [c["metaData"]["id"] for c in calls if c.get("metaData", {}).get("id")]
+    log.info("gong: fetching transcripts for %d calls…", len(all_call_ids))
+    transcripts = _fetch_transcripts(all_call_ids)
+    log.info("gong: got transcripts for %d / %d calls", len(transcripts), len(all_call_ids))
 
     rows = []
     for call in calls:
@@ -116,8 +153,12 @@ def sync(sb: Client, resolver: AccountResolver, days_back: int = 90) -> None:
         emails = [p.get("emailAddress") for p in call.get("parties", []) if p.get("emailAddress")]
 
         content = call.get("content", {})
+        call_id = call["metaData"]["id"]
+        transcript_segments = transcripts.get(call_id, [])
+        transcript_text = _transcript_to_text(transcript_segments) if transcript_segments else None
+
         rows.append({
-            "id": call["metaData"]["id"],
+            "id": call_id,
             "account_id": acct_id,
             "title": call["metaData"].get("title"),
             "call_url": call["metaData"].get("url"),
@@ -131,12 +172,12 @@ def sync(sb: Client, resolver: AccountResolver, days_back: int = 90) -> None:
             "action_items": content.get("pointsOfInterest", []),
             "key_points": content.get("keyPoints", []),
             "trackers_hit": [t["name"] for t in content.get("trackers", []) if t.get("name")],
+            "transcript": transcript_text,
             "raw": call.get("metaData", {}),
             "synced_at": datetime.utcnow().isoformat(),
         })
 
     if rows:
-        # upsert in batches of 200
         for i in range(0, len(rows), 200):
             sb.table("gong_calls").upsert(rows[i:i+200], on_conflict="id").execute()
     log.info("gong: upserted %d calls", len(rows))
